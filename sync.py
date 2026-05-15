@@ -65,12 +65,12 @@ def cfg_bool(config: dict, key: str, env_var: str, default: bool) -> bool:
     return str(val).lower() in ("true", "1", "yes")
 
 
-def require(name: str, value) -> str:
+def require(name: str, env_var: str, value) -> str:
     """Fail fast if a required config value is missing or empty."""
     if not value:
         raise RuntimeError(
             f"Missing required config: '{name}'. "
-            f"Set it in config.yaml or as environment variable {name.upper()}."
+            f"Set it in config.yaml or as environment variable {env_var}."
         )
     return str(value)
 
@@ -122,18 +122,19 @@ log = logging.getLogger("star-sync")
 
 def validate_config() -> None:
     """Raise RuntimeError immediately if any required value is missing."""
-    require("navidrome_user",     NAVIDROME_USER)
-    require("navidrome_pass",     NAVIDROME_PASS)
-    require("lidarr_api_key",     LIDARR_API_KEY)
-    require("lidarr_root_folder", LIDARR_ROOT_FOLDER)
+    require("navidrome_user",     "NAVIDROME_USER",     NAVIDROME_USER)
+    require("navidrome_pass",     "NAVIDROME_PASS",     NAVIDROME_PASS)
+    require("lidarr_api_key",     "LIDARR_API_KEY",     LIDARR_API_KEY)
+    require("lidarr_root_folder", "LIDARR_ROOT_FOLDER", LIDARR_ROOT_FOLDER)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HTTP helpers — shared sessions + retry/backoff
+# HTTP helpers — separate sessions per service + retry/backoff
 # ══════════════════════════════════════════════════════════════════════════════
 
-_lidarr_session = requests.Session()
-_mb_session     = requests.Session()
+_navidrome_session  = requests.Session()
+_lidarr_session     = requests.Session()
+_mb_session         = requests.Session()
 _mb_session.headers.update({"User-Agent": "navidrome-star-to-lidarr/1.0 (self-hosted)"})
 
 
@@ -142,9 +143,11 @@ def _request_with_retry(session: requests.Session, method: str, url: str,
     """
     Make an HTTP request with automatic retry and exponential backoff.
     Retries on 429 (rate limit), 500, 502, 503, 504.
+    On final failure, includes the response body in the error for easier debugging.
     """
     RETRYABLE = {429, 500, 502, 503, 504}
-    last_exc = None
+    last_exc  = None
+    last_resp = None
 
     for attempt in range(1, retries + 1):
         try:
@@ -153,24 +156,35 @@ def _request_with_retry(session: requests.Session, method: str, url: str,
                 wait = backoff ** attempt
                 log.warning(f"  HTTP {resp.status_code} from {url} — retrying in {wait:.0f}s "
                             f"(attempt {attempt}/{retries})")
+                last_resp = resp
                 time.sleep(wait)
                 continue
             return resp
         except requests.exceptions.ConnectionError as exc:
-            last_exc = exc
+            last_exc  = exc
+            last_resp = None
             wait = backoff ** attempt
-            log.warning(f"  Connection error ({exc}) — retrying in {wait:.0f}s "
-                        f"(attempt {attempt}/{retries})")
+            log.warning(f"  Connection error — retrying in {wait:.0f}s "
+                        f"(attempt {attempt}/{retries}): {exc}")
             time.sleep(wait)
 
-    raise RuntimeError(f"Request failed after {retries} attempts: {last_exc or 'HTTP error'}")
+    # All retries exhausted — include response body if available
+    body_hint = ""
+    if last_resp is not None:
+        body_hint = f" — response: {last_resp.text[:500]}"
+    raise RuntimeError(
+        f"Request to {url} failed after {retries} attempts{body_hint}"
+        if not last_exc else
+        f"Request to {url} failed after {retries} attempts: {last_exc}"
+    )
 
 
 def _nd_get(path: str, **params) -> requests.Response:
+    """GET request to Navidrome Subsonic API."""
     base_params = {"u": NAVIDROME_USER, "p": NAVIDROME_PASS,
                    "v": "1.16.0", "c": "star-sync", "f": "json"}
     return _request_with_retry(
-        _lidarr_session, "GET", f"{NAVIDROME_URL}{path}",
+        _navidrome_session, "GET", f"{NAVIDROME_URL}{path}",
         params={**base_params, **params}, timeout=15,
     )
 
@@ -258,7 +272,7 @@ def load_state() -> dict:
             return json.loads(path.read_text())
         except Exception as exc:
             log.warning(f"Could not read state file ({exc}) — starting fresh")
-    return {"processed_ids": []}
+    return {"processed_ids": [], "skipped_ids": []}
 
 
 def save_state(state: dict) -> None:
@@ -458,12 +472,26 @@ def find_file_in_downloads(song: dict) -> Path | None:
 # Per-song processing pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
-def process_song(song: dict) -> bool:
+def process_song(song: dict) -> tuple[bool, bool]:
+    """
+    Full pipeline for one starred song.
+
+    Returns (success, skipped) where:
+      success=True  — song was handled and should be marked as processed
+      skipped=True  — song was intentionally skipped (main library, settings off)
+                      and should be tracked separately so it can be reconsidered
+                      if settings change later
+    """
     artist_name = song.get("artist", "").strip()
     title       = song.get("title",  "").strip()
     album_name  = song.get("album",  "").strip()
 
     log.info(f"── Processing: {artist_name} — {title} (album: {album_name})")
+
+    # ── Guard: require artist and title ─────────────────────────────────────
+    if not artist_name or not title:
+        log.warning(f"  Missing artist or title — skipping")
+        return False, False
 
     # ── Step 1: determine library source ────────────────────────────────────
     file_path   = find_file_in_downloads(song)
@@ -471,19 +499,24 @@ def process_song(song: dict) -> bool:
 
     if from_aurral:
         log.info(f"  Source: Aurral flows library  ({file_path})")
+        # Guard: require album name for Aurral tracks since we need it for matching
+        if not album_name:
+            log.warning(f"  Missing album name — cannot safely match album in Lidarr. Skipping.")
+            return False, False
     else:
         if PROCESS_MAIN_LIBRARY_STARS:
             log.info(f"  Source: main library  (will ensure artist is in Lidarr)")
         else:
             log.info(f"  Source: main library — skipping "
                      f"(set process_main_library_stars: true in config to process)")
-            return True
+            # Return skipped=True so this can be reconsidered if the setting changes
+            return False, True
 
     # ── Step 2: look up artist in MusicBrainz ───────────────────────────────
     mbid = mb_find_artist_mbid(artist_name)
     if not mbid:
         log.warning(f"  Cannot find '{artist_name}' in MusicBrainz — skipping.")
-        return False
+        return False, False
 
     # ── Step 3: add artist to Lidarr if not already present ─────────────────
     artist = lidarr_find_artist(mbid)
@@ -495,27 +528,27 @@ def process_song(song: dict) -> bool:
             artist = lidarr_wait_for_artist(mbid)
             if not artist:
                 log.error(f"  Artist never appeared in Lidarr — aborting.")
-                return False
+                return False, False
 
     if not from_aurral:
         log.info(f"  ✓ Done (main library — artist ensured in Lidarr): {artist_name}")
-        return True
+        return True, False
 
     if DRY_RUN:
         log.info(f"  [DRY RUN] Would find album '{album_name}', monitor it, and trigger search")
-        return True
+        return True, False
 
     # ── Step 4: find matching album ──────────────────────────────────────────
     artist_id = artist["id"]
     albums    = lidarr_wait_for_albums(artist_id)
     if not albums:
         log.error(f"  No albums found in Lidarr for {artist_name} — aborting.")
-        return False
+        return False, False
 
     album = lidarr_find_matching_album(albums, album_name)
     if not album:
         log.error(f"  Could not match album '{album_name}' for {artist_name} — aborting.")
-        return False
+        return False, False
 
     log.info(f"  Matched album: {album.get('title')} (id={album.get('id')})")
 
@@ -526,7 +559,7 @@ def process_song(song: dict) -> bool:
     lidarr_search_album(album["id"])
 
     log.info(f"  ✓ Done: {artist_name} — {album.get('title')} queued for download")
-    return True
+    return True, False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -536,9 +569,14 @@ def process_song(song: dict) -> bool:
 def run_once(poll_count: int) -> None:
     log.info(f"─ Poll #{poll_count} {'(dry run) ' if DRY_RUN else ''}─────────────────────────────────────────")
 
-    state     = load_state()
-    processed = set(state.get("processed_ids", []))
+    state      = load_state()
+    processed  = set(state.get("processed_ids", []))
+    skipped    = set(state.get("skipped_ids",   []))
 
+    # Songs to consider: not yet processed, and not skipped
+    # (unless process_main_library_stars was just enabled — in that case
+    # skipped songs will be reconsidered on the next poll automatically
+    # because we only skip them when the setting is off)
     try:
         starred = get_starred_songs()
     except Exception as exc:
@@ -546,9 +584,20 @@ def run_once(poll_count: int) -> None:
         log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
         return
 
-    new_songs = [s for s in starred if s.get("id") not in processed]
+    # If process_main_library_stars is now enabled, clear the skipped list
+    # so previously-skipped main library songs get reconsidered
+    if PROCESS_MAIN_LIBRARY_STARS and skipped:
+        log.info(f"  process_main_library_stars is enabled — reconsidering "
+                 f"{len(skipped)} previously skipped song(s)")
+        skipped = set()
+        state["skipped_ids"] = []
+
+    new_songs = [s for s in starred
+                 if s.get("id") not in processed
+                 and s.get("id") not in skipped]
+
     if not new_songs:
-        log.info(f"  No new starred songs — {len(processed)} already processed")
+        log.info(f"  No new starred songs — {len(processed)} processed, {len(skipped)} skipped")
         log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
         return
 
@@ -557,14 +606,19 @@ def run_once(poll_count: int) -> None:
     for song in new_songs:
         song_id = song.get("id")
         try:
-            success = process_song(song)
+            success, song_skipped = process_song(song)
         except Exception as exc:
             log.error(f"Unexpected error on '{song.get('title')}': {exc}", exc_info=True)
-            success = False
+            success, song_skipped = False, False
 
         if success:
             processed.add(song_id)
             state["processed_ids"] = list(processed)
+        elif song_skipped:
+            skipped.add(song_id)
+            state["skipped_ids"] = list(skipped)
+
+        if success or song_skipped:
             save_state(state)
 
     log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
