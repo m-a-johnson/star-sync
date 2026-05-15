@@ -409,7 +409,9 @@ def process_song(song: dict) -> bool:
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_once() -> None:
+def run_once(poll_count: int) -> None:
+    log.info(f"─ Poll #{poll_count} {'(dry run) ' if DRY_RUN else ''}─────────────────────────────────────────")
+
     state     = load_state()
     processed = set(state.get("processed_ids", []))
 
@@ -417,14 +419,16 @@ def run_once() -> None:
         starred = get_starred_songs()
     except Exception as exc:
         log.error(f"Failed to fetch starred songs from Navidrome: {exc}")
+        log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
         return
 
     new_songs = [s for s in starred if s.get("id") not in processed]
     if not new_songs:
-        log.debug("No new starred songs.")
+        log.info(f"  No new starred songs — {len(processed)} already processed")
+        log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
         return
 
-    log.info(f"Found {len(new_songs)} new starred song(s) to process.")
+    log.info(f"  Found {len(new_songs)} new starred song(s) to process")
 
     for song in new_songs:
         song_id = song.get("id")
@@ -439,6 +443,8 @@ def run_once() -> None:
             state["processed_ids"] = list(processed)
             save_state(state)
 
+    log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
+
 
 def main() -> None:
     log.info("═" * 60)
@@ -451,9 +457,11 @@ def main() -> None:
     log.info(f"  Dry run   : {DRY_RUN}")
     log.info("═" * 60)
 
+    poll_count = 0
     while True:
+        poll_count += 1
         try:
-            run_once()
+            run_once(poll_count)
         except Exception as exc:
             log.error(f"Unhandled error in main loop: {exc}")
         time.sleep(POLL_INTERVAL)
