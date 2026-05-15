@@ -446,7 +446,21 @@ def run_once(poll_count: int) -> None:
     log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
 
 
+
 def main() -> None:
+    import signal
+    import threading
+
+    # Use an Event instead of time.sleep so we wake up immediately on shutdown
+    stop_event = threading.Event()
+
+    def handle_shutdown(signum, frame):
+        log.info("Shutdown signal received — stopping cleanly…")
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
     log.info("═" * 60)
     log.info("navidrome-star-to-lidarr  starting up")
     log.info(f"  Config    : {CONFIG_FILE}")
@@ -458,13 +472,15 @@ def main() -> None:
     log.info("═" * 60)
 
     poll_count = 0
-    while True:
+    while not stop_event.is_set():
         poll_count += 1
         try:
             run_once(poll_count)
         except Exception as exc:
             log.error(f"Unhandled error in main loop: {exc}")
-        time.sleep(POLL_INTERVAL)
+        stop_event.wait(timeout=POLL_INTERVAL)
+
+    log.info("star-sync stopped.")
 
 
 if __name__ == "__main__":
