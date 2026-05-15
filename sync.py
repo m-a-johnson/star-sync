@@ -553,7 +553,19 @@ def process_song(song: dict) -> tuple[bool, bool]:
     log.info(f"  Matched album: {album.get('title')} (id={album.get('id')})")
 
     # ── Step 5: monitor the album ────────────────────────────────────────────
+    # Small delay to give Lidarr time to fully settle album metadata
+    # before accepting monitor updates
+    log.debug(f"  Waiting 10s for Lidarr to settle before monitoring...")
+    time.sleep(10)
     lidarr_monitor_album(album["id"], album.get("title", ""))
+
+    # Verify the monitor call actually stuck
+    albums_check  = lidarr_get_albums(artist_id)
+    matched_check = next((a for a in albums_check if a["id"] == album["id"]), None)
+    if matched_check and not matched_check.get("monitored"):
+        log.warning(f"  Album does not appear monitored after update — retrying once...")
+        time.sleep(5)
+        lidarr_monitor_album(album["id"], album.get("title", ""))
 
     # ── Step 6: trigger search ───────────────────────────────────────────────
     lidarr_search_album(album["id"])
