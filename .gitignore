@@ -1,5 +1,5 @@
-# Local env file with real credentials — never commit this
-.env
+# Real config with credentials — never commit this
+config.yaml
 
 # State file generated at runtime
 data/

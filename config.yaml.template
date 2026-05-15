@@ -1,0 +1,67 @@
+# ── star-sync configuration ────────────────────────────────────────────────────
+# Copy this file to your server at:
+# /path/to/appdata/star-sync/config.yaml
+# and fill in your values.
+#
+# Any setting here can be overridden by setting the corresponding
+# environment variable (uppercase, underscores). For example:
+#   dry_run: true  can be overridden by  DRY_RUN=false
+#
+# This file is NOT committed to git — it contains real credentials.
+# The .template version in the repo is the safe reference copy.
+
+# ── Navidrome ──────────────────────────────────────────────────────────────────
+navidrome_url: http://navidrome:4533
+navidrome_user:                        # your Navidrome username
+navidrome_pass:                        # your Navidrome password
+
+# Only process starred songs from this library (your Aurral/flows library).
+# Find your library IDs by opening this URL in your browser:
+# http://your-navidrome/rest/getMusicFolders.view?u=USER&p=PASS&v=1.16.0&c=test&f=json
+# Leave empty to process stars from all libraries.
+navidrome_flows_library_id:
+
+# ── Lidarr ─────────────────────────────────────────────────────────────────────
+lidarr_url: http://lidarr:8686
+lidarr_api_key:                        # Settings → General → Security → API Key
+
+# Must match the root folder path configured inside Lidarr
+lidarr_root_folder:
+
+# Find profile IDs at:
+# http://your-lidarr/api/v1/qualityprofile?apikey=YOUR_KEY
+# http://your-lidarr/api/v1/metadataprofile?apikey=YOUR_KEY
+lidarr_quality_profile_id: 1
+lidarr_metadata_profile_id: 1
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+# Path to Aurral downloads folder inside this container (matches volume mount)
+downloads_path: /downloads
+
+# Persistent state file — tracks which songs have already been processed
+state_file: /data/state.json
+
+# ── Behaviour ──────────────────────────────────────────────────────────────────
+
+# How often to check for new starred songs in seconds (300 = every 5 minutes)
+poll_interval: 300
+
+# Set to true to preview actions without making any changes to Lidarr.
+# Recommended for first run — change to false when ready to go live.
+dry_run: true
+
+# If true, starring a song from your main library also ensures the artist
+# is in Lidarr. If false (default), only Aurral flows stars are processed.
+process_main_library_stars: false
+
+# Seconds to wait for Lidarr to finish indexing a newly added artist
+artist_wait_timeout: 120
+
+# Seconds to wait for Lidarr to finish loading an artist's albums
+album_wait_timeout: 120
+
+# Seconds between MusicBrainz requests — do not set below 1.0
+mb_rate_limit: 1.2
+
+# Log verbosity: DEBUG, INFO, WARNING, ERROR
+log_level: INFO

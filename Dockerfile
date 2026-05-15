@@ -2,8 +2,8 @@ FROM python:3.12-alpine
 
 WORKDIR /app
 
-# Install dependencies — only 'requests' needed, no heavy frameworks
-RUN pip install --no-cache-dir requests==2.32.3
+# Install dependencies
+RUN pip install --no-cache-dir requests==2.32.3 pyyaml==6.0.2
 
 COPY sync.py .
 

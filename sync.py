@@ -6,8 +6,11 @@ Polls Navidrome for newly starred tracks, finds the artist in MusicBrainz,
 adds them to Lidarr as unmonitored, then monitors and searches for the
 specific album containing the starred track.
 
-All behaviour is controlled via environment variables (see Configuration block).
-Run with DRY_RUN=true to preview actions without touching Lidarr.
+Configuration is read from config.yaml (mounted into the container).
+Any setting can be overridden by setting the corresponding environment variable.
+
+Run with DRY_RUN=true (or dry_run: true in config.yaml) to preview actions
+without touching Lidarr.
 """
 
 import os
@@ -17,36 +20,82 @@ import logging
 from pathlib import Path
 
 import requests
+import yaml
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Configuration  ── every value comes from an environment variable
+# Config loading — YAML first, environment variables override
 # ══════════════════════════════════════════════════════════════════════════════
 
-NAVIDROME_URL               = os.getenv("NAVIDROME_URL",                "http://navidrome:4533")
-NAVIDROME_USER              = os.getenv("NAVIDROME_USER",               "admin")
-NAVIDROME_PASS              = os.getenv("NAVIDROME_PASS",               "")
+CONFIG_FILE = os.getenv("CONFIG_FILE", "/config/config.yaml")
 
-# Only fetch starred songs from this Navidrome library ID.
-# Use getMusicFolders to find your library IDs.
-# Leave empty to fetch from all libraries.
-NAVIDROME_FLOWS_LIBRARY_ID  = os.getenv("NAVIDROME_FLOWS_LIBRARY_ID",  "")
 
-LIDARR_URL                  = os.getenv("LIDARR_URL",                   "http://lidarr:8686")
-LIDARR_API_KEY              = os.getenv("LIDARR_API_KEY",               "")
-LIDARR_ROOT_FOLDER          = os.getenv("LIDARR_ROOT_FOLDER",           "/music/library")
-LIDARR_QUALITY_PROFILE_ID   = int(os.getenv("LIDARR_QUALITY_PROFILE_ID",  "1"))
-LIDARR_METADATA_PROFILE_ID  = int(os.getenv("LIDARR_METADATA_PROFILE_ID", "1"))
+def load_config() -> dict:
+    """
+    Load configuration from config.yaml, then apply any environment variable
+    overrides on top. Environment variables always win.
+    """
+    config = {}
+    path = Path(CONFIG_FILE)
+    if path.exists():
+        with open(path) as f:
+            config = yaml.safe_load(f) or {}
+    else:
+        logging.warning(f"Config file not found at {CONFIG_FILE} — using environment variables only")
+    return config
 
-DOWNLOADS_PATH              = os.getenv("DOWNLOADS_PATH",               "/downloads")
-STATE_FILE                  = os.getenv("STATE_FILE",                   "/data/state.json")
-POLL_INTERVAL               = int(os.getenv("POLL_INTERVAL",            "300"))
-MB_RATE_LIMIT               = float(os.getenv("MB_RATE_LIMIT",          "1.2"))
-ARTIST_WAIT_TIMEOUT         = int(os.getenv("ARTIST_WAIT_TIMEOUT",      "120"))
-ALBUM_WAIT_TIMEOUT          = int(os.getenv("ALBUM_WAIT_TIMEOUT",       "120"))
-PROCESS_MAIN_LIBRARY_STARS  = os.getenv("PROCESS_MAIN_LIBRARY_STARS", "false").lower() == "true"
-DRY_RUN                     = os.getenv("DRY_RUN", "false").lower() == "true"
-LOG_LEVEL                   = os.getenv("LOG_LEVEL", "INFO").upper()
-AUDIO_EXTENSIONS            = {".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac", ".wav"}
+
+def cfg(config: dict, key: str, env_var: str, default=None):
+    """
+    Resolve a config value. Priority: env var > config.yaml > default.
+    """
+    if env_var in os.environ:
+        return os.environ[env_var]
+    return config.get(key, default)
+
+
+def cfg_int(config: dict, key: str, env_var: str, default: int) -> int:
+    return int(cfg(config, key, env_var, default))
+
+
+def cfg_float(config: dict, key: str, env_var: str, default: float) -> float:
+    return float(cfg(config, key, env_var, default))
+
+
+def cfg_bool(config: dict, key: str, env_var: str, default: bool) -> bool:
+    val = cfg(config, key, env_var, default)
+    if isinstance(val, bool):
+        return val
+    return str(val).lower() in ("true", "1", "yes")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Bootstrap — load config before anything else
+# ══════════════════════════════════════════════════════════════════════════════
+
+_config = load_config()
+
+NAVIDROME_URL               = cfg      (_config, "navidrome_url",               "NAVIDROME_URL",               "http://navidrome:4533")
+NAVIDROME_USER              = cfg      (_config, "navidrome_user",              "NAVIDROME_USER",              "admin")
+NAVIDROME_PASS              = cfg      (_config, "navidrome_pass",              "NAVIDROME_PASS",              "")
+NAVIDROME_FLOWS_LIBRARY_ID  = cfg      (_config, "navidrome_flows_library_id",  "NAVIDROME_FLOWS_LIBRARY_ID",  "")
+
+LIDARR_URL                  = cfg      (_config, "lidarr_url",                  "LIDARR_URL",                  "http://lidarr:8686")
+LIDARR_API_KEY              = cfg      (_config, "lidarr_api_key",              "LIDARR_API_KEY",              "")
+LIDARR_ROOT_FOLDER          = cfg      (_config, "lidarr_root_folder",          "LIDARR_ROOT_FOLDER",          "/music/library")
+LIDARR_QUALITY_PROFILE_ID   = cfg_int  (_config, "lidarr_quality_profile_id",   "LIDARR_QUALITY_PROFILE_ID",   1)
+LIDARR_METADATA_PROFILE_ID  = cfg_int  (_config, "lidarr_metadata_profile_id",  "LIDARR_METADATA_PROFILE_ID",  1)
+
+DOWNLOADS_PATH              = cfg      (_config, "downloads_path",              "DOWNLOADS_PATH",              "/downloads")
+STATE_FILE                  = cfg      (_config, "state_file",                  "STATE_FILE",                  "/data/state.json")
+POLL_INTERVAL               = cfg_int  (_config, "poll_interval",               "POLL_INTERVAL",               300)
+MB_RATE_LIMIT               = cfg_float(_config, "mb_rate_limit",               "MB_RATE_LIMIT",               1.2)
+ARTIST_WAIT_TIMEOUT         = cfg_int  (_config, "artist_wait_timeout",         "ARTIST_WAIT_TIMEOUT",         120)
+ALBUM_WAIT_TIMEOUT          = cfg_int  (_config, "album_wait_timeout",          "ALBUM_WAIT_TIMEOUT",          120)
+PROCESS_MAIN_LIBRARY_STARS  = cfg_bool (_config, "process_main_library_stars",  "PROCESS_MAIN_LIBRARY_STARS",  False)
+DRY_RUN                     = cfg_bool (_config, "dry_run",                     "DRY_RUN",                     False)
+LOG_LEVEL                   = cfg      (_config, "log_level",                   "LOG_LEVEL",                   "INFO").upper()
+
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac", ".wav"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Logging
@@ -303,7 +352,7 @@ def process_song(song: dict) -> bool:
             log.info(f"  Source: main library  (will ensure artist is in Lidarr)")
         else:
             log.info(f"  Source: main library — skipping "
-                     f"(set PROCESS_MAIN_LIBRARY_STARS=true to process)")
+                     f"(set process_main_library_stars: true in config to process)")
             return True
 
     # ── Step 2: look up artist in MusicBrainz ───────────────────────────────
@@ -394,8 +443,9 @@ def run_once() -> None:
 def main() -> None:
     log.info("═" * 60)
     log.info("navidrome-star-to-lidarr  starting up")
+    log.info(f"  Config    : {CONFIG_FILE}")
     log.info(f"  Navidrome : {NAVIDROME_URL}")
-    log.info(f"  Lidarr    : http://lidarr:8686")
+    log.info(f"  Lidarr    : {LIDARR_URL}")
     log.info(f"  Downloads : {DOWNLOADS_PATH}")
     log.info(f"  Poll      : every {POLL_INTERVAL}s")
     log.info(f"  Dry run   : {DRY_RUN}")
