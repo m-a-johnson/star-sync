@@ -16,7 +16,9 @@ without touching Lidarr.
 import os
 import json
 import time
+import signal
 import logging
+import threading
 from pathlib import Path
 
 import requests
@@ -30,10 +32,7 @@ CONFIG_FILE = os.getenv("CONFIG_FILE", "/config/config.yaml")
 
 
 def load_config() -> dict:
-    """
-    Load configuration from config.yaml, then apply any environment variable
-    overrides on top. Environment variables always win.
-    """
+    """Load configuration from config.yaml. Environment variables override."""
     config = {}
     path = Path(CONFIG_FILE)
     if path.exists():
@@ -45,9 +44,7 @@ def load_config() -> dict:
 
 
 def cfg(config: dict, key: str, env_var: str, default=None):
-    """
-    Resolve a config value. Priority: env var > config.yaml > default.
-    """
+    """Resolve a config value. Priority: env var > config.yaml > default."""
     if env_var in os.environ:
         return os.environ[env_var]
     return config.get(key, default)
@@ -68,6 +65,16 @@ def cfg_bool(config: dict, key: str, env_var: str, default: bool) -> bool:
     return str(val).lower() in ("true", "1", "yes")
 
 
+def require(name: str, value) -> str:
+    """Fail fast if a required config value is missing or empty."""
+    if not value:
+        raise RuntimeError(
+            f"Missing required config: '{name}'. "
+            f"Set it in config.yaml or as environment variable {name.upper()}."
+        )
+    return str(value)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Bootstrap — load config before anything else
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,13 +82,13 @@ def cfg_bool(config: dict, key: str, env_var: str, default: bool) -> bool:
 _config = load_config()
 
 NAVIDROME_URL               = cfg      (_config, "navidrome_url",               "NAVIDROME_URL",               "http://navidrome:4533")
-NAVIDROME_USER              = cfg      (_config, "navidrome_user",              "NAVIDROME_USER",              "admin")
+NAVIDROME_USER              = cfg      (_config, "navidrome_user",              "NAVIDROME_USER",              "")
 NAVIDROME_PASS              = cfg      (_config, "navidrome_pass",              "NAVIDROME_PASS",              "")
 NAVIDROME_FLOWS_LIBRARY_ID  = cfg      (_config, "navidrome_flows_library_id",  "NAVIDROME_FLOWS_LIBRARY_ID",  "")
 
 LIDARR_URL                  = cfg      (_config, "lidarr_url",                  "LIDARR_URL",                  "http://lidarr:8686")
 LIDARR_API_KEY              = cfg      (_config, "lidarr_api_key",              "LIDARR_API_KEY",              "")
-LIDARR_ROOT_FOLDER          = cfg      (_config, "lidarr_root_folder",          "LIDARR_ROOT_FOLDER",          "/music/library")
+LIDARR_ROOT_FOLDER          = cfg      (_config, "lidarr_root_folder",          "LIDARR_ROOT_FOLDER",          "")
 LIDARR_QUALITY_PROFILE_ID   = cfg_int  (_config, "lidarr_quality_profile_id",   "LIDARR_QUALITY_PROFILE_ID",   1)
 LIDARR_METADATA_PROFILE_ID  = cfg_int  (_config, "lidarr_metadata_profile_id",  "LIDARR_METADATA_PROFILE_ID",  1)
 
@@ -108,6 +115,138 @@ logging.basicConfig(
 )
 log = logging.getLogger("star-sync")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Validate required config — fail fast before the main loop starts
+# ══════════════════════════════════════════════════════════════════════════════
+
+def validate_config() -> None:
+    """Raise RuntimeError immediately if any required value is missing."""
+    require("navidrome_user",     NAVIDROME_USER)
+    require("navidrome_pass",     NAVIDROME_PASS)
+    require("lidarr_api_key",     LIDARR_API_KEY)
+    require("lidarr_root_folder", LIDARR_ROOT_FOLDER)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP helpers — shared sessions + retry/backoff
+# ══════════════════════════════════════════════════════════════════════════════
+
+_lidarr_session = requests.Session()
+_mb_session     = requests.Session()
+_mb_session.headers.update({"User-Agent": "navidrome-star-to-lidarr/1.0 (self-hosted)"})
+
+
+def _request_with_retry(session: requests.Session, method: str, url: str,
+                         retries: int = 3, backoff: float = 2.0, **kwargs) -> requests.Response:
+    """
+    Make an HTTP request with automatic retry and exponential backoff.
+    Retries on 429 (rate limit), 500, 502, 503, 504.
+    """
+    RETRYABLE = {429, 500, 502, 503, 504}
+    last_exc = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = session.request(method, url, **kwargs)
+            if resp.status_code in RETRYABLE:
+                wait = backoff ** attempt
+                log.warning(f"  HTTP {resp.status_code} from {url} — retrying in {wait:.0f}s "
+                            f"(attempt {attempt}/{retries})")
+                time.sleep(wait)
+                continue
+            return resp
+        except requests.exceptions.ConnectionError as exc:
+            last_exc = exc
+            wait = backoff ** attempt
+            log.warning(f"  Connection error ({exc}) — retrying in {wait:.0f}s "
+                        f"(attempt {attempt}/{retries})")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Request failed after {retries} attempts: {last_exc or 'HTTP error'}")
+
+
+def _nd_get(path: str, **params) -> requests.Response:
+    base_params = {"u": NAVIDROME_USER, "p": NAVIDROME_PASS,
+                   "v": "1.16.0", "c": "star-sync", "f": "json"}
+    return _request_with_retry(
+        _lidarr_session, "GET", f"{NAVIDROME_URL}{path}",
+        params={**base_params, **params}, timeout=15,
+    )
+
+
+def _lidarr_get(path: str, **params) -> requests.Response:
+    return _request_with_retry(
+        _lidarr_session, "GET", f"{LIDARR_URL}{path}",
+        headers={"X-Api-Key": LIDARR_API_KEY},
+        params=params, timeout=15,
+    )
+
+
+def _lidarr_post(path: str, payload: dict) -> requests.Response:
+    return _request_with_retry(
+        _lidarr_session, "POST", f"{LIDARR_URL}{path}",
+        headers={"X-Api-Key": LIDARR_API_KEY},
+        json=payload, timeout=15,
+    )
+
+
+def _lidarr_put(path: str, payload: dict) -> requests.Response:
+    return _request_with_retry(
+        _lidarr_session, "PUT", f"{LIDARR_URL}{path}",
+        headers={"X-Api-Key": LIDARR_API_KEY},
+        json=payload, timeout=15,
+    )
+
+
+def _mb_get(path: str, **params) -> requests.Response:
+    return _request_with_retry(
+        _mb_session, "GET", f"https://musicbrainz.org/ws/2{path}",
+        params={**params, "fmt": "json"}, timeout=15,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Startup validation — confirm Lidarr is reachable and config is valid
+# ══════════════════════════════════════════════════════════════════════════════
+
+def validate_lidarr() -> None:
+    """
+    Confirm Lidarr is reachable, the API key works, and the configured
+    root folder and profile IDs actually exist.
+    """
+    log.info("  Validating Lidarr connection…")
+
+    resp = _lidarr_get("/api/v1/rootfolder")
+    resp.raise_for_status()
+    root_folders = [rf["path"] for rf in resp.json()]
+    if LIDARR_ROOT_FOLDER not in root_folders:
+        raise RuntimeError(
+            f"lidarr_root_folder '{LIDARR_ROOT_FOLDER}' not found in Lidarr. "
+            f"Available: {root_folders}"
+        )
+
+    resp = _lidarr_get("/api/v1/qualityprofile")
+    resp.raise_for_status()
+    quality_ids = [p["id"] for p in resp.json()]
+    if LIDARR_QUALITY_PROFILE_ID not in quality_ids:
+        raise RuntimeError(
+            f"lidarr_quality_profile_id {LIDARR_QUALITY_PROFILE_ID} not found. "
+            f"Available IDs: {quality_ids}"
+        )
+
+    resp = _lidarr_get("/api/v1/metadataprofile")
+    resp.raise_for_status()
+    metadata_ids = [p["id"] for p in resp.json()]
+    if LIDARR_METADATA_PROFILE_ID not in metadata_ids:
+        raise RuntimeError(
+            f"lidarr_metadata_profile_id {LIDARR_METADATA_PROFILE_ID} not found. "
+            f"Available IDs: {metadata_ids}"
+        )
+
+    log.info("  Lidarr connection OK ✓")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # State management
 # ══════════════════════════════════════════════════════════════════════════════
@@ -123,30 +262,24 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    """Write state atomically — temp file then rename to avoid corruption."""
     path = Path(STATE_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2))
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Navidrome  (Subsonic-compatible API)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _nd_params(**extra) -> dict:
-    return {"u": NAVIDROME_USER, "p": NAVIDROME_PASS,
-            "v": "1.16.0", "c": "star-sync", "f": "json", **extra}
-
-
 def get_starred_songs() -> list:
     """Return every song the user has starred in Navidrome, optionally filtered by library."""
-    params = _nd_params()
+    params = {}
     if NAVIDROME_FLOWS_LIBRARY_ID:
         params["musicFolderId"] = NAVIDROME_FLOWS_LIBRARY_ID
-    resp = requests.get(
-        f"{NAVIDROME_URL}/rest/getStarred2.view",
-        params=params,
-        timeout=15,
-    )
+    resp = _nd_get("/rest/getStarred2.view", **params)
     resp.raise_for_status()
     body = resp.json().get("subsonic-response", {})
     if body.get("status") != "ok":
@@ -158,38 +291,37 @@ def get_starred_songs() -> list:
 # MusicBrainz
 # ══════════════════════════════════════════════════════════════════════════════
 
-_MB_HEADERS = {"User-Agent": "navidrome-star-to-lidarr/1.0 (self-hosted)"}
-
-
 def mb_find_artist_mbid(artist_name: str) -> str | None:
+    """
+    Search MusicBrainz for an artist by name.
+    Prefers exact name matches, falls back to highest-scored result.
+    """
     time.sleep(MB_RATE_LIMIT)
-    resp = requests.get(
-        "https://musicbrainz.org/ws/2/artist/",
-        params={"query": f'artist:"{artist_name}"', "fmt": "json", "limit": 5},
-        headers=_MB_HEADERS,
-        timeout=15,
-    )
+    resp = _mb_get("/artist/", query=f'artist:"{artist_name}"', limit=5)
     resp.raise_for_status()
     artists = resp.json().get("artists", [])
+
     if not artists:
         log.warning(f"  MusicBrainz: no artist found for '{artist_name}'")
         return None
+
     for a in artists:
         if a.get("name", "").lower() == artist_name.lower():
+            log.debug(f"  MusicBrainz: exact match '{artist_name}' → {a['id']} (score {a.get('score')})")
             return a["id"]
-    return artists[0]["id"]
+
+    best = max(artists, key=lambda a: int(a.get("score", 0)))
+    log.debug(f"  MusicBrainz: best match for '{artist_name}' → "
+              f"'{best.get('name')}' {best['id']} (score {best.get('score')})")
+    return best["id"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Lidarr API
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _lidarr_headers() -> dict:
-    return {"X-Api-Key": LIDARR_API_KEY}
-
-
 def lidarr_find_artist(mbid: str) -> dict | None:
-    resp = requests.get(f"{LIDARR_URL}/api/v1/artist", headers=_lidarr_headers(), timeout=15)
+    resp = _lidarr_get("/api/v1/artist")
     resp.raise_for_status()
     for artist in resp.json():
         if artist.get("foreignArtistId") == mbid:
@@ -214,7 +346,7 @@ def lidarr_add_artist(artist_name: str, mbid: str) -> dict | None:
     if DRY_RUN:
         log.info(f"  [DRY RUN] Would add artist to Lidarr: {artist_name} ({mbid})")
         return None
-    resp = requests.post(f"{LIDARR_URL}/api/v1/artist", headers=_lidarr_headers(), json=payload, timeout=15)
+    resp = _lidarr_post("/api/v1/artist", payload)
     if resp.status_code == 400:
         log.info(f"  Artist already in Lidarr: {artist_name}")
         return None
@@ -236,12 +368,7 @@ def lidarr_wait_for_artist(mbid: str) -> dict | None:
 
 
 def lidarr_get_albums(artist_id: int) -> list:
-    resp = requests.get(
-        f"{LIDARR_URL}/api/v1/album",
-        headers=_lidarr_headers(),
-        params={"artistId": artist_id},
-        timeout=15,
-    )
+    resp = _lidarr_get("/api/v1/album", artistId=artist_id)
     resp.raise_for_status()
     return resp.json()
 
@@ -260,16 +387,23 @@ def lidarr_wait_for_albums(artist_id: int) -> list:
 
 
 def lidarr_find_matching_album(albums: list, album_name: str) -> dict | None:
+    """
+    Find the best matching album by name.
+    Does NOT fall back to a random album — returns None if no confident match
+    to avoid accidentally monitoring the wrong album.
+    """
     album_name_lower = album_name.lower().strip()
+
     for album in albums:
         if album.get("title", "").lower().strip() == album_name_lower:
             return album
+
     for album in albums:
-        if album_name_lower in album.get("title", "").lower():
+        title = album.get("title", "").lower().strip()
+        if album_name_lower in title or title in album_name_lower:
             return album
-    if albums:
-        log.debug(f"  No album name match for '{album_name}' — using first album")
-        return albums[0]
+
+    log.warning(f"  No confident album match for '{album_name}' — skipping rather than guessing")
     return None
 
 
@@ -277,12 +411,7 @@ def lidarr_monitor_album(album_id: int, album_title: str) -> bool:
     if DRY_RUN:
         log.info(f"  [DRY RUN] Would monitor album: {album_title} (id={album_id})")
         return True
-    resp = requests.put(
-        f"{LIDARR_URL}/api/v1/album/monitor",
-        headers=_lidarr_headers(),
-        json={"albumIds": [album_id], "monitored": True},
-        timeout=15,
-    )
+    resp = _lidarr_put("/api/v1/album/monitor", {"albumIds": [album_id], "monitored": True})
     resp.raise_for_status()
     log.info(f"  Monitoring album: {album_title} (id={album_id})")
     return True
@@ -292,12 +421,7 @@ def lidarr_search_album(album_id: int) -> bool:
     if DRY_RUN:
         log.info(f"  [DRY RUN] Would trigger search for album id={album_id}")
         return True
-    resp = requests.post(
-        f"{LIDARR_URL}/api/v1/command",
-        headers=_lidarr_headers(),
-        json={"name": "AlbumSearch", "albumIds": [album_id]},
-        timeout=15,
-    )
+    resp = _lidarr_post("/api/v1/command", {"name": "AlbumSearch", "albumIds": [album_id]})
     resp.raise_for_status()
     log.info(f"  Triggered search for album id={album_id}")
     return True
@@ -390,7 +514,7 @@ def process_song(song: dict) -> bool:
 
     album = lidarr_find_matching_album(albums, album_name)
     if not album:
-        log.error(f"  Could not match album '{album_name}' — aborting.")
+        log.error(f"  Could not match album '{album_name}' for {artist_name} — aborting.")
         return False
 
     log.info(f"  Matched album: {album.get('title')} (id={album.get('id')})")
@@ -418,7 +542,7 @@ def run_once(poll_count: int) -> None:
     try:
         starred = get_starred_songs()
     except Exception as exc:
-        log.error(f"Failed to fetch starred songs from Navidrome: {exc}")
+        log.error(f"Failed to fetch starred songs from Navidrome: {exc}", exc_info=True)
         log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
         return
 
@@ -435,7 +559,7 @@ def run_once(poll_count: int) -> None:
         try:
             success = process_song(song)
         except Exception as exc:
-            log.error(f"Unexpected error on '{song.get('title')}': {exc}")
+            log.error(f"Unexpected error on '{song.get('title')}': {exc}", exc_info=True)
             success = False
 
         if success:
@@ -446,12 +570,7 @@ def run_once(poll_count: int) -> None:
     log.info(f"─ Poll #{poll_count} complete — next poll in {POLL_INTERVAL}s ─")
 
 
-
 def main() -> None:
-    import signal
-    import threading
-
-    # Use an Event instead of time.sleep so we wake up immediately on shutdown
     stop_event = threading.Event()
 
     def handle_shutdown(signum, frame):
@@ -460,6 +579,14 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+
+    # Validate config and connections before starting the main loop
+    try:
+        validate_config()
+        validate_lidarr()
+    except RuntimeError as exc:
+        logging.critical(f"Startup validation failed: {exc}")
+        raise SystemExit(1)
 
     log.info("═" * 60)
     log.info("navidrome-star-to-lidarr  starting up")
@@ -477,7 +604,7 @@ def main() -> None:
         try:
             run_once(poll_count)
         except Exception as exc:
-            log.error(f"Unhandled error in main loop: {exc}")
+            log.error(f"Unhandled error in main loop: {exc}", exc_info=True)
         stop_event.wait(timeout=POLL_INTERVAL)
 
     log.info("star-sync stopped.")
