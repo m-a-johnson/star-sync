@@ -1,0 +1,10 @@
+# Local env file with real credentials — never commit this
+.env
+
+# State file generated at runtime
+data/
+*.json
+
+# Python
+__pycache__/
+*.pyc
