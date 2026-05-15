@@ -25,6 +25,10 @@ import requests
 NAVIDROME_URL               = os.getenv("NAVIDROME_URL",                "http://navidrome:4533")
 NAVIDROME_USER              = os.getenv("NAVIDROME_USER",               "admin")
 NAVIDROME_PASS              = os.getenv("NAVIDROME_PASS",               "")
+# Only fetch starred songs from this Navidrome library ID.
+# Use getMusicFolders to find your library IDs.
+# Leave empty to fetch from all libraries.
+NAVIDROME_FLOWS_LIBRARY_ID = os.getenv("NAVIDROME_FLOWS_LIBRARY_ID", "")
 
 LIDARR_URL                  = os.getenv("LIDARR_URL",                   "http://lidarr:8686")
 LIDARR_API_KEY              = os.getenv("LIDARR_API_KEY",               "")
@@ -101,10 +105,13 @@ def _nd_params(**extra) -> dict:
 
 
 def get_starred_songs() -> list:
-    """Return every song the user has starred in Navidrome."""
+    """Return starred songs from Navidrome, optionally filtered by library."""
+    params = _nd_params()
+    if NAVIDROME_FLOWS_LIBRARY_ID:
+        params["musicFolderId"] = NAVIDROME_FLOWS_LIBRARY_ID
     resp = requests.get(
         f"{NAVIDROME_URL}/rest/getStarred2.view",
-        params=_nd_params(),
+        params=params,
         timeout=15,
     )
     resp.raise_for_status()
