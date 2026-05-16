@@ -315,6 +315,23 @@ def get_starred_songs() -> list:
 # MusicBrainz
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Standard MusicBrainz UUID format: 8-4-4-4-12 hex characters
+_MBID_PATTERN = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE
+)
+
+
+def extract_first_valid_mbid(raw) -> str | None:
+    """Extract first valid MusicBrainz UUID from a string.
+    Handles concatenated IDs by finding the first UUID-shaped substring.
+    """
+    if not raw:
+        return None
+    match = _MBID_PATTERN.search(str(raw))
+    return match.group(0) if match else None
+
+
 # Common multi-artist separators in file tags
 _ARTIST_SEPARATORS = re.compile(r'[;/\\]|\s+&\s+|\s+feat\.?\s+|\s+ft\.?\s+|\s+x\s+', re.IGNORECASE)
 
@@ -341,6 +358,29 @@ def _mb_search_artist(artist_name: str) -> str | None:
     log.debug(f"  MusicBrainz: best match for '{artist_name}' → "
               f"'{best.get('name')}' {best['id']} (score {best.get('score')})")
     return best["id"]
+
+
+def mb_find_artist_from_recording(recording_id: str) -> str | None:
+    """
+    Look up a MusicBrainz recording by ID and return the primary artist MBID.
+    This is faster and more accurate than text search — no ambiguity.
+    """
+    time.sleep(MB_RATE_LIMIT)
+    resp = _mb_get(f"/recording/{recording_id}", inc="artists")
+    resp.raise_for_status()
+    data = resp.json()
+
+    artist_credits = data.get("artist-credit", [])
+    for credit in artist_credits:
+        if isinstance(credit, dict) and "artist" in credit:
+            mbid = credit["artist"].get("id")
+            name = credit["artist"].get("name", "?")
+            if mbid:
+                log.info(f"  MusicBrainz: recording {recording_id} → artist '{name}' ({mbid})")
+                return mbid
+
+    log.warning(f"  MusicBrainz: no artist found in recording {recording_id}")
+    return None
 
 
 def mb_find_artist_mbid(artist_name: str) -> str | None:
@@ -497,8 +537,8 @@ def read_tags_from_file(file_path: Path) -> dict:
         if suffix == ".flac":
             tags = FLAC(file_path)
             return {
-                "mbid_artist":  tags.get("musicbrainz_artistid",  [None])[0],
-                "mbid_release": tags.get("musicbrainz_albumid",   [None])[0],
+                "mbid_artist":  extract_first_valid_mbid(tags.get("musicbrainz_artistid",  [None])[0]),
+                "mbid_release": extract_first_valid_mbid(tags.get("musicbrainz_albumid",   [None])[0]),
                 "artist":       tags.get("artist",                 [None])[0],
                 "album":        tags.get("album",                  [None])[0],
                 "title":        tags.get("title",                  [None])[0],
@@ -507,8 +547,8 @@ def read_tags_from_file(file_path: Path) -> dict:
         elif suffix in (".mp3",):
             tags = ID3(file_path)
             return {
-                "mbid_artist":  str(tags["TXXX:MusicBrainz Artist Id"]) if "TXXX:MusicBrainz Artist Id" in tags else None,
-                "mbid_release": str(tags["TXXX:MusicBrainz Album Id"])  if "TXXX:MusicBrainz Album Id"  in tags else None,
+                "mbid_artist":  extract_first_valid_mbid(str(tags["TXXX:MusicBrainz Artist Id"])) if "TXXX:MusicBrainz Artist Id" in tags else None,
+                "mbid_release": extract_first_valid_mbid(str(tags["TXXX:MusicBrainz Album Id"]))  if "TXXX:MusicBrainz Album Id"  in tags else None,
                 "artist":       str(tags["TPE1"]) if "TPE1" in tags else None,
                 "album":        str(tags["TALB"]) if "TALB" in tags else None,
                 "title":        str(tags["TIT2"]) if "TIT2" in tags else None,
@@ -517,8 +557,8 @@ def read_tags_from_file(file_path: Path) -> dict:
         elif suffix in (".m4a", ".aac"):
             tags = MP4(file_path)
             return {
-                "mbid_artist":  tags.get("----:com.apple.iTunes:MusicBrainz Artist Id",  [None])[0],
-                "mbid_release": tags.get("----:com.apple.iTunes:MusicBrainz Album Id",   [None])[0],
+                "mbid_artist":  extract_first_valid_mbid(tags.get("----:com.apple.iTunes:MusicBrainz Artist Id",  [None])[0]),
+                "mbid_release": extract_first_valid_mbid(tags.get("----:com.apple.iTunes:MusicBrainz Album Id",   [None])[0]),
                 "artist":       str(tags.get("\xa9ART", [None])[0]) if tags.get("\xa9ART") else None,
                 "album":        str(tags.get("\xa9alb", [None])[0]) if tags.get("\xa9alb") else None,
                 "title":        str(tags.get("\xa9nam", [None])[0]) if tags.get("\xa9nam") else None,
@@ -602,19 +642,35 @@ def process_song(song: dict) -> tuple[bool, bool]:
             return False, True
 
     # ── Step 2: get MusicBrainz artist ID ──────────────────────────────────
-    # First try reading it directly from the file tags (fast, accurate)
-    # Fall back to MusicBrainz text search if not embedded
+    # Priority:
+    #   1. Recording ID from Navidrome → MusicBrainz recording lookup (fastest, most accurate)
+    #   2. Artist MBID from file tags → use directly (mutagen)
+    #   3. albumArtists[0] text search → avoids multi-artist string splitting
+    #   4. artist field text search → last resort with multi-artist fallback
+
     mbid = None
-    if file_path:
+    recording_id = song.get("musicBrainzId", "").strip()
+
+    if recording_id:
+        log.info(f"  Using MusicBrainz recording ID from Navidrome: {recording_id}")
+        mbid = mb_find_artist_from_recording(recording_id)
+
+    if not mbid and file_path:
         file_tags = read_tags_from_file(file_path)
         mbid = file_tags.get("mbid_artist")
         if mbid:
             log.info(f"  MusicBrainz artist ID from file tags: {mbid}")
-        else:
-            log.debug(f"  No MusicBrainz artist ID in file tags — searching by name")
 
     if not mbid:
-        mbid = mb_find_artist_mbid(artist_name)
+        # Prefer albumArtists over artists — albumArtists is who owns the album
+        # e.g. "Yeah! feat. Lil Jon" → albumArtist=Usher, not Lil Jon
+        album_artists = song.get("albumArtists", [])
+        search_name = album_artists[0].get("name", "").strip() if album_artists else ""
+        if not search_name:
+            search_name = artist_name
+        if search_name != artist_name:
+            log.info(f"  Using album artist '{search_name}' instead of track artist '{artist_name}'")
+        mbid = mb_find_artist_mbid(search_name)
 
     if not mbid:
         log.warning(f"  Cannot find '{artist_name}' in MusicBrainz — skipping.")
