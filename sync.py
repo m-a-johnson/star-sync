@@ -317,7 +317,6 @@ PENDING_FILE_HEADER = """# ─────────────────�
 # Once an item is successfully processed it will be removed from this file.
 # ─────────────────────────────────────────────────────────────────────────────
 
-items:
 """
 
 
@@ -337,34 +336,26 @@ def load_pending() -> list:
 
 def save_pending(items: list) -> None:
     """
-    Write pending items back to the pending file.
+    Write pending items back to the pending file atomically.
     Creates the file with the instructions header if it doesn't exist yet.
-    Removes items that have been successfully processed (mb_release_group_id set
-    and processed flag True — we filter those out before calling this).
+    Writes the header as a comment block, then a clean yaml items list.
     """
     path = Path(PENDING_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not path.exists():
-        # First time — write the full header
-        path.write_text(PENDING_FILE_HEADER)
-
-    # Re-read the current file content (preserves the header and any comments)
-    # then overwrite just the items block
-    data = {"items": items}
-    # Write cleanly: header comment block + yaml items
     tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        # Write the instructions header (no items: key — yaml.dump adds it below)
         f.write(PENDING_FILE_HEADER)
-        if items:
-            # Write each item with a blank line between them for readability
-            yaml_str = yaml.dump({"items": items},
-                                  default_flow_style=False,
-                                  allow_unicode=True,
-                                  sort_keys=False)
-            # Strip the "items:" key since it's already in the header
-            items_yaml = yaml_str.replace("items:\n", "").strip()
-            f.write(items_yaml + "\n")
+        # yaml.dump({"items": items}) writes the full "items:\n- ..." structure
+        yaml_str = yaml.dump(
+            {"items": items},
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        f.write(yaml_str)
+
     tmp.replace(path)
 
 
@@ -422,6 +413,13 @@ def process_pending_items() -> None:
         # Search Lidarr albums for this artist and find the one matching the
         # MusicBrainz release group ID
         try:
+            # Refresh artist metadata so Lidarr fetches any missing releases
+            # (e.g. singles that weren't in the original metadata fetch)
+            log.info(f"  Refreshing Lidarr metadata for artist id={artist_id}…")
+            lidarr_refresh_artist(artist_id)
+            log.info(f"  Waiting 15s for Lidarr to refresh artist metadata…")
+            time.sleep(15)
+
             albums = lidarr_get_albums(artist_id)
             album  = next(
                 (a for a in albums if a.get("foreignAlbumId", "") == rg_id),
@@ -429,8 +427,16 @@ def process_pending_items() -> None:
             )
 
             if not album:
-                log.warning(f"  Release group {rg_id} not found in Lidarr for artist {artist_id} — "
-                             f"Lidarr may not have fetched it yet. Will retry next poll.")
+                log.warning(f"  Release group {rg_id} not found in Lidarr for artist {artist_id} "
+                             f"even after metadata refresh.")
+                log.warning(f"  Possible causes:")
+                log.warning(f"    1. Lidarr is still fetching — will retry next poll")
+                log.warning(f"    2. Incomplete MusicBrainz metadata (missing country/format) — "
+                             f"Lidarr may never index it automatically")
+                log.warning(f"    3. Wrong release group ID — double-check at "
+                             f"https://musicbrainz.org/release-group/{rg_id}")
+                log.warning(f"  If this keeps failing, add it manually in Lidarr: "
+                             f"go to the artist page → Singles → search icon → search '{item.get('album', '')}'")
                 remaining.append(item)
                 continue
 
@@ -591,8 +597,15 @@ def lidarr_add_artist(artist_name: str, mbid: str) -> dict | None:
         return None
     resp = _lidarr_post("/api/v1/artist", payload)
     if resp.status_code == 400:
-        log.info(f"  Artist already in Lidarr: {artist_name}")
-        return None
+        # A 400 can mean "already exists" OR a validation failure.
+        # Only treat it as a harmless duplicate if the body says so.
+        body = resp.text.lower()
+        if "already" in body or "exist" in body or "duplicate" in body:
+            log.info(f"  Artist already in Lidarr: {artist_name}")
+            return None
+        # Otherwise it's a real validation error — log and raise
+        log.error(f"  Lidarr rejected artist add for {artist_name}: {resp.text[:300]}")
+        resp.raise_for_status()
     resp.raise_for_status()
     log.info(f"  Added artist to Lidarr: {artist_name} ({mbid})")
     return resp.json()
@@ -660,6 +673,17 @@ def lidarr_monitor_album(album_id: int, album_title: str) -> bool:
     return True
 
 
+def lidarr_refresh_artist(artist_id: int) -> None:
+    """Trigger a metadata refresh for an artist in Lidarr."""
+    if DRY_RUN:
+        log.debug(f"  [DRY RUN] Would refresh artist metadata for id={artist_id}")
+        return
+    resp = _lidarr_post("/api/v1/command",
+                        {"name": "RefreshArtist", "artistId": artist_id})
+    resp.raise_for_status()
+    log.debug(f"  Triggered metadata refresh for artist id={artist_id}")
+
+
 def lidarr_search_album(album_id: int) -> bool:
     if DRY_RUN:
         log.info(f"  [DRY RUN] Would trigger search for album id={album_id}")
@@ -690,7 +714,7 @@ def read_tags_from_file(file_path: Path) -> dict:
             tags = FLAC(file_path)
             return {
                 "mbid_artist":  extract_first_valid_mbid(tags.get("musicbrainz_artistid",  [None])[0]),
-                "mbid_release": extract_first_valid_mbid(tags.get("musicbrainz_albumid",   [None])[0]),
+                "mbid_release_group": extract_first_valid_mbid(tags.get("musicbrainz_albumid",   [None])[0]),  # Note: MusicBrainz Album Id tags are often release IDs, not release-group IDs. Not currently used for Lidarr matching.
                 "artist":       tags.get("artist",                 [None])[0],
                 "album":        tags.get("album",                  [None])[0],
                 "title":        tags.get("title",                  [None])[0],
@@ -700,7 +724,7 @@ def read_tags_from_file(file_path: Path) -> dict:
             tags = ID3(file_path)
             return {
                 "mbid_artist":  extract_first_valid_mbid(str(tags["TXXX:MusicBrainz Artist Id"])) if "TXXX:MusicBrainz Artist Id" in tags else None,
-                "mbid_release": extract_first_valid_mbid(str(tags["TXXX:MusicBrainz Album Id"]))  if "TXXX:MusicBrainz Album Id"  in tags else None,
+                "mbid_release_group": extract_first_valid_mbid(str(tags["TXXX:MusicBrainz Album Id"]))  if "TXXX:MusicBrainz Album Id"  in tags else None,  # Note: often a release ID, not release-group ID. Not currently used for Lidarr matching.
                 "artist":       str(tags["TPE1"]) if "TPE1" in tags else None,
                 "album":        str(tags["TALB"]) if "TALB" in tags else None,
                 "title":        str(tags["TIT2"]) if "TIT2" in tags else None,
@@ -710,7 +734,7 @@ def read_tags_from_file(file_path: Path) -> dict:
             tags = MP4(file_path)
             return {
                 "mbid_artist":  extract_first_valid_mbid(tags.get("----:com.apple.iTunes:MusicBrainz Artist Id",  [None])[0]),
-                "mbid_release": extract_first_valid_mbid(tags.get("----:com.apple.iTunes:MusicBrainz Album Id",   [None])[0]),
+                "mbid_release_group": extract_first_valid_mbid(tags.get("----:com.apple.iTunes:MusicBrainz Album Id",   [None])[0]),  # Note: often a release ID, not release-group ID. Not currently used for Lidarr matching.
                 "artist":       str(tags.get("\xa9ART", [None])[0]) if tags.get("\xa9ART") else None,
                 "album":        str(tags.get("\xa9alb", [None])[0]) if tags.get("\xa9alb") else None,
                 "title":        str(tags.get("\xa9nam", [None])[0]) if tags.get("\xa9nam") else None,
@@ -860,7 +884,9 @@ def process_song(song: dict) -> tuple[bool, bool]:
         log.warning(f"  Could not match album '{album_name}' for {artist_name}.")
         add_to_pending(song, artist["id"],
                        f"Album name '{album_name}' not matched in Lidarr — may be a single or different title")
-        return False, False
+        # Return True so this song is marked as processed and won't be retried
+        # via normal processing — the pending file is now managing it
+        return True, False
 
     log.info(f"  Matched album: {album.get('title')} (id={album.get('id')})")
 
