@@ -41,6 +41,11 @@ downloads_path: /downloads
 # Persistent state file — tracks which songs have already been processed
 state_file: /data/state.json
 
+# Pending interventions file — songs that could not be automatically matched.
+# star-sync writes failed items here; you fill in mb_release_group_id manually
+# and it will be picked up on the next poll.
+pending_file: /data/pending.yaml
+
 # ── Behaviour ──────────────────────────────────────────────────────────────────
 
 # How often to check for new starred songs in seconds (300 = every 5 minutes)

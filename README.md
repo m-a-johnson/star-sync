@@ -6,7 +6,7 @@ Watches [Navidrome](https://www.navidrome.org/) for starred tracks and automatic
 
 1. ❤️ You star a song in Navidrome (from an [Aurral](https://github.com/lklynet/aurral) flow playlist)
 2. 🔍 star-sync detects it via the Navidrome Subsonic API
-3. 🎵 Looks up the artist in MusicBrainz
+3. 🎵 Looks up the artist in MusicBrainz (via recording ID, file tags, or name search)
 4. ➕ Adds the artist to Lidarr as **unmonitored** (no whole-discography downloads)
 5. 📀 Finds the matching album and sets it to **monitored**
 6. ⬇️ Triggers a search — Lidarr starts downloading
@@ -69,6 +69,7 @@ config can be overridden by setting `DRY_RUN=false` in the compose environment b
 | `lidarr_metadata_profile_id` | Lidarr metadata profile ID | `1` |
 | `downloads_path` | Path to Aurral downloads folder inside this container | `/downloads` |
 | `state_file` | Path to state file (tracks processed songs) | `/data/state.json` |
+| `pending_file` | Path to pending interventions file | `/data/pending.yaml` |
 | `poll_interval` | Seconds between Navidrome polls | `300` |
 | `dry_run` | Log actions without making changes | `true` |
 | `process_main_library_stars` | Also add artists from main library stars to Lidarr | `false` |
@@ -93,6 +94,32 @@ Use the `id` value for your Aurral/flows library.
 http://your-lidarr/api/v1/qualityprofile?apikey=YOUR_KEY
 http://your-lidarr/api/v1/metadataprofile?apikey=YOUR_KEY
 ```
+
+## Artist lookup
+
+star-sync uses a priority chain to find the correct MusicBrainz artist ID:
+
+1. **Recording ID from Navidrome** — most accurate, used when the file has a MusicBrainz recording ID embedded
+2. **Artist MBID from file tags** — reads embedded MusicBrainz artist ID using mutagen
+3. **Album artist text search** — uses `albumArtists[0]` to avoid multi-artist confusion (e.g. uses "Usher" not "Lil Jon; Ludacris; Usher")
+4. **Track artist text search** — last resort, splits multi-artist strings on common separators (`;`, `&`, `feat.`, etc.)
+
+## Pending interventions
+
+When star-sync cannot match an album in Lidarr (e.g. for singles or albums with different titles), it writes the item to `pending.yaml` rather than silently failing.
+
+To resolve a pending item:
+
+1. Open `pending.yaml` on your server
+2. Find the unresolved item (empty `mb_release_group_id`)
+3. Search MusicBrainz for the artist + album: `https://musicbrainz.org`
+4. Copy the UUID from the release group URL:
+   ```
+   https://musicbrainz.org/release-group/87f8f3b6-476e-40b0-8f5f-ea2ebc1743a2
+                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   ```
+5. Paste it into `mb_release_group_id` and save the file
+6. star-sync picks it up on the next poll, monitors the album, and removes it from the file
 
 ## Dry run mode
 

@@ -104,6 +104,7 @@ LIDARR_METADATA_PROFILE_ID  = cfg_int  (_config, "lidarr_metadata_profile_id",  
 
 DOWNLOADS_PATH              = cfg      (_config, "downloads_path",              "DOWNLOADS_PATH",              "/downloads")
 STATE_FILE                  = cfg      (_config, "state_file",                  "STATE_FILE",                  "/data/state.json")
+PENDING_FILE                = cfg      (_config, "pending_file",                "PENDING_FILE",                "/data/pending.yaml")
 POLL_INTERVAL               = cfg_int  (_config, "poll_interval",               "POLL_INTERVAL",               300)
 MB_RATE_LIMIT               = cfg_float(_config, "mb_rate_limit",               "MB_RATE_LIMIT",               1.2)
 ARTIST_WAIT_TIMEOUT         = cfg_int  (_config, "artist_wait_timeout",         "ARTIST_WAIT_TIMEOUT",         120)
@@ -292,6 +293,157 @@ def save_state(state: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2))
     tmp.replace(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pending interventions file
+# ══════════════════════════════════════════════════════════════════════════════
+
+PENDING_FILE_HEADER = """# ─────────────────────────────────────────────────────────────────────────────
+# star-sync pending interventions
+# ─────────────────────────────────────────────────────────────────────────────
+# These are songs that star-sync could not automatically match to a Lidarr
+# album. To resolve an item:
+#
+#   1. Find the MusicBrainz release group for the album:
+#      Go to https://musicbrainz.org and search for the artist + album name.
+#      Copy the UUID from the URL, e.g.:
+#        https://musicbrainz.org/release-group/87f8f3b6-476e-40b0-8f5f-ea2ebc1743a2
+#                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#   2. Paste the UUID into mb_release_group_id for that item below
+#   3. Save the file — star-sync will pick it up on the next poll
+#
+# Do not change any other fields.
+# Once an item is successfully processed it will be removed from this file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+items:
+"""
+
+
+def load_pending() -> list:
+    """Load pending intervention items from the pending file."""
+    path = Path(PENDING_FILE)
+    if not path.exists():
+        return []
+    try:
+        data = yaml.safe_load(path.read_text())
+        if data and isinstance(data.get("items"), list):
+            return data["items"]
+    except Exception as exc:
+        log.warning(f"Could not read pending file ({exc})")
+    return []
+
+
+def save_pending(items: list) -> None:
+    """
+    Write pending items back to the pending file.
+    Creates the file with the instructions header if it doesn't exist yet.
+    Removes items that have been successfully processed (mb_release_group_id set
+    and processed flag True — we filter those out before calling this).
+    """
+    path = Path(PENDING_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not path.exists():
+        # First time — write the full header
+        path.write_text(PENDING_FILE_HEADER)
+
+    # Re-read the current file content (preserves the header and any comments)
+    # then overwrite just the items block
+    data = {"items": items}
+    # Write cleanly: header comment block + yaml items
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        f.write(PENDING_FILE_HEADER)
+        if items:
+            # Write each item with a blank line between them for readability
+            yaml_str = yaml.dump({"items": items},
+                                  default_flow_style=False,
+                                  allow_unicode=True,
+                                  sort_keys=False)
+            # Strip the "items:" key since it's already in the header
+            items_yaml = yaml_str.replace("items:\n", "").strip()
+            f.write(items_yaml + "\n")
+    tmp.replace(path)
+
+
+def add_to_pending(song: dict, lidarr_artist_id: int, note: str) -> None:
+    """Add a song to the pending interventions file."""
+    items = load_pending()
+
+    song_id = song.get("id", "")
+
+    # Don't add duplicates
+    if any(item.get("song_id") == song_id for item in items):
+        log.debug(f"  Already in pending file: {song.get('title')}")
+        return
+
+    item = {
+        "song_id":            song_id,
+        "artist":             song.get("artist", ""),
+        "album":              song.get("album", ""),
+        "lidarr_artist_id":   lidarr_artist_id,
+        "note":               note,
+        "mb_release_group_id": "",
+    }
+    items.append(item)
+    save_pending(items)
+    log.info(f"  Added to pending file: {PENDING_FILE}")
+    log.info(f"  Find the MusicBrainz release group at:")
+    log.info(f"    https://musicbrainz.org/search?query={song.get('artist', '').replace(' ', '+')}+{song.get('album', '').replace(' ', '+')}&type=release_group")
+
+
+def process_pending_items() -> None:
+    """
+    Check the pending file for items that have been filled in with a
+    mb_release_group_id and process them.
+    """
+    items = load_pending()
+    if not items:
+        return
+
+    ready = [i for i in items if i.get("mb_release_group_id", "").strip()]
+    if not ready:
+        log.debug(f"  Pending file has {len(items)} item(s) awaiting manual intervention")
+        return
+
+    log.info(f"  Found {len(ready)} pending item(s) with MusicBrainz IDs to process")
+    remaining = [i for i in items if not i.get("mb_release_group_id", "").strip()]
+
+    for item in ready:
+        artist_id    = item.get("lidarr_artist_id")
+        rg_id        = item.get("mb_release_group_id", "").strip()
+        artist_name  = item.get("artist", "")
+        album_name   = item.get("album", "")
+
+        log.info(f"  Processing pending: {artist_name} — {album_name} (rg={rg_id})")
+
+        # Search Lidarr albums for this artist and find the one matching the
+        # MusicBrainz release group ID
+        try:
+            albums = lidarr_get_albums(artist_id)
+            album  = next(
+                (a for a in albums if a.get("foreignAlbumId", "") == rg_id),
+                None
+            )
+
+            if not album:
+                log.warning(f"  Release group {rg_id} not found in Lidarr for artist {artist_id} — "
+                             f"Lidarr may not have fetched it yet. Will retry next poll.")
+                remaining.append(item)
+                continue
+
+            log.info(f"  Matched via MusicBrainz release group: {album.get('title')} (id={album['id']})")
+            lidarr_monitor_album(album["id"], album.get("title", ""))
+            lidarr_search_album(album["id"])
+            log.info(f"  ✓ Pending resolved: {artist_name} — {album.get('title')} queued for download")
+
+        except Exception as exc:
+            log.error(f"  Error processing pending item: {exc}", exc_info=True)
+            remaining.append(item)
+
+    save_pending(remaining)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -705,7 +857,9 @@ def process_song(song: dict) -> tuple[bool, bool]:
 
     album = lidarr_find_matching_album(albums, album_name)
     if not album:
-        log.error(f"  Could not match album '{album_name}' for {artist_name} — aborting.")
+        log.warning(f"  Could not match album '{album_name}' for {artist_name}.")
+        add_to_pending(song, artist["id"],
+                       f"Album name '{album_name}' not matched in Lidarr — may be a single or different title")
         return False, False
 
     log.info(f"  Matched album: {album.get('title')} (id={album.get('id')})")
@@ -738,6 +892,10 @@ def process_song(song: dict) -> tuple[bool, bool]:
 
 def run_once(poll_count: int) -> None:
     log.info(f"─ Poll #{poll_count} {'(dry run) ' if DRY_RUN else ''}─────────────────────────────────────────")
+
+    # Check pending interventions first
+    if not DRY_RUN:
+        process_pending_items()
 
     state      = load_state()
     processed  = set(state.get("processed_ids", []))
