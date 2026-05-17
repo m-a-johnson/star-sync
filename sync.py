@@ -361,7 +361,7 @@ def save_pending(items: list) -> None:
     tmp.replace(path)
 
 
-def add_to_pending(song: dict, lidarr_artist_id: int, note: str) -> None:
+def add_to_pending(song: dict, lidarr_artist_id: int, note: str, file_path: Path | None = None) -> None:
     """Add a song to the pending interventions file."""
     items = load_pending()
 
@@ -376,6 +376,11 @@ def add_to_pending(song: dict, lidarr_artist_id: int, note: str) -> None:
         "song_id":             song_id,
         "artist":              song.get("artist", ""),
         "album":               song.get("album", ""),
+        "title":               song.get("title", ""),   # fallback for find_file_in_downloads
+        "path":                song.get("path", ""),    # fallback for find_file_in_downloads
+        # Full container path as star-sync sees it — faster and exact.
+        # Stored at add time when the file is confirmed to exist.
+        "file_path":           str(file_path) if file_path else "",
         "lidarr_artist_id":    lidarr_artist_id,
         "note":                note,
         "retry_count":         0,
@@ -473,8 +478,15 @@ def process_pending_items() -> None:
             log.warning(f"  Most likely cause: incomplete MusicBrainz metadata for release group {rg_id}")
             log.warning(f"  Attempting to rescue file to: {RESCUE_PATH}")
 
-            # Find the original file in the Aurral downloads folder
-            file_path = find_file_in_downloads(item)
+            # Use the stored container path first (fast, exact).
+            # Fall back to search if the path wasn't stored or file moved.
+            stored_path = item.get("file_path", "").strip()
+            if stored_path and Path(stored_path).exists():
+                file_path = Path(stored_path)
+                log.debug(f"  Using stored file path: {file_path}")
+            else:
+                log.debug(f"  Stored path missing or gone — searching downloads folder")
+                file_path = find_file_in_downloads(item)
             if file_path:
                 rescued = rescue_file(item, file_path)
                 if rescued:
@@ -970,7 +982,8 @@ def process_song(song: dict) -> tuple[bool, bool]:
     if not album:
         log.warning(f"  Could not match album '{album_name}' for {artist_name}.")
         add_to_pending(song, artist["id"],
-                       f"Album name '{album_name}' not matched in Lidarr — may be a single or different title")
+                       f"Album name '{album_name}' not matched in Lidarr — may be a single or different title",
+                       file_path=file_path)
         # Return True so this song is marked as processed and won't be retried
         # via normal processing — the pending file is now managing it
         return True, False
