@@ -105,6 +105,7 @@ LIDARR_METADATA_PROFILE_ID  = cfg_int  (_config, "lidarr_metadata_profile_id",  
 DOWNLOADS_PATH              = cfg      (_config, "downloads_path",              "DOWNLOADS_PATH",              "/downloads")
 STATE_FILE                  = cfg      (_config, "state_file",                  "STATE_FILE",                  "/data/state.json")
 PENDING_FILE                = cfg      (_config, "pending_file",                "PENDING_FILE",                "/data/pending.yaml")
+PENDING_MAX_RETRIES         = cfg_int  (_config, "pending_max_retries",         "PENDING_MAX_RETRIES",         5)
 POLL_INTERVAL               = cfg_int  (_config, "poll_interval",               "POLL_INTERVAL",               300)
 MB_RATE_LIMIT               = cfg_float(_config, "mb_rate_limit",               "MB_RATE_LIMIT",               1.2)
 ARTIST_WAIT_TIMEOUT         = cfg_int  (_config, "artist_wait_timeout",         "ARTIST_WAIT_TIMEOUT",         120)
@@ -371,11 +372,12 @@ def add_to_pending(song: dict, lidarr_artist_id: int, note: str) -> None:
         return
 
     item = {
-        "song_id":            song_id,
-        "artist":             song.get("artist", ""),
-        "album":              song.get("album", ""),
-        "lidarr_artist_id":   lidarr_artist_id,
-        "note":               note,
+        "song_id":             song_id,
+        "artist":              song.get("artist", ""),
+        "album":               song.get("album", ""),
+        "lidarr_artist_id":    lidarr_artist_id,
+        "note":                note,
+        "retry_count":         0,
         "mb_release_group_id": "",
     }
     items.append(item)
@@ -407,14 +409,26 @@ def process_pending_items() -> None:
         rg_id        = item.get("mb_release_group_id", "").strip()
         artist_name  = item.get("artist", "")
         album_name   = item.get("album", "")
+        retry_count  = item.get("retry_count", 0)
 
-        log.info(f"  Processing pending: {artist_name} — {album_name} (rg={rg_id})")
+        log.info(f"  Processing pending: {artist_name} — {album_name} "
+                 f"(rg={rg_id}, attempt {retry_count + 1}/{PENDING_MAX_RETRIES})")
+
+        # If retry limit reached, stop the refresh cycle and just log guidance
+        if retry_count >= PENDING_MAX_RETRIES:
+            log.warning(f"  Retry limit ({PENDING_MAX_RETRIES}) reached for: {artist_name} — {album_name}")
+            log.warning(f"  This release cannot be found in Lidarr automatically.")
+            log.warning(f"  Most likely cause: incomplete MusicBrainz metadata for release group {rg_id}")
+            log.warning(f"  To fix: create a free account at https://musicbrainz.org and add")
+            log.warning(f"    the missing Country and Format data to:")
+            log.warning(f"    https://musicbrainz.org/release-group/{rg_id}")
+            log.warning(f"  Once fixed, reset retry_count to 0 in pending.yaml and star-sync will retry.")
+            remaining.append(item)
+            continue
 
         # Search Lidarr albums for this artist and find the one matching the
         # MusicBrainz release group ID
         try:
-            # Refresh artist metadata so Lidarr fetches any missing releases
-            # (e.g. singles that weren't in the original metadata fetch)
             log.info(f"  Refreshing Lidarr metadata for artist id={artist_id}…")
             lidarr_refresh_artist(artist_id)
             log.info(f"  Waiting 15s for Lidarr to refresh artist metadata…")
@@ -427,16 +441,14 @@ def process_pending_items() -> None:
             )
 
             if not album:
-                log.warning(f"  Release group {rg_id} not found in Lidarr for artist {artist_id} "
-                             f"even after metadata refresh.")
-                log.warning(f"  Possible causes:")
-                log.warning(f"    1. Lidarr is still fetching — will retry next poll")
-                log.warning(f"    2. Incomplete MusicBrainz metadata (missing country/format) — "
-                             f"Lidarr may never index it automatically")
-                log.warning(f"    3. Wrong release group ID — double-check at "
-                             f"https://musicbrainz.org/release-group/{rg_id}")
-                log.warning(f"  If this keeps failing, add it manually in Lidarr: "
-                             f"go to the artist page → Singles → search icon → search '{item.get('album', '')}'")
+                item["retry_count"] = retry_count + 1
+                if item["retry_count"] >= PENDING_MAX_RETRIES:
+                    log.warning(f"  Release group {rg_id} still not found after {item['retry_count']} attempts.")
+                    log.warning(f"  Retry limit will be reached — no more refresh cycles after next poll.")
+                    log.warning(f"  Check MusicBrainz data at: https://musicbrainz.org/release-group/{rg_id}")
+                else:
+                    log.warning(f"  Release group {rg_id} not found after refresh "
+                                f"(attempt {item['retry_count']}/{PENDING_MAX_RETRIES}) — will retry next poll")
                 remaining.append(item)
                 continue
 

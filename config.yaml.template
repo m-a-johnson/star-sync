@@ -46,6 +46,11 @@ state_file: /data/state.json
 # and it will be picked up on the next poll.
 pending_file: /data/pending.yaml
 
+# How many times to attempt a pending item before giving up the refresh cycle.
+# After this many attempts the item stays in pending.yaml with instructions
+# on how to fix it, but no more refresh calls are made.
+pending_max_retries: 5
+
 # ── Behaviour ──────────────────────────────────────────────────────────────────
 
 # How often to check for new starred songs in seconds (300 = every 5 minutes)
