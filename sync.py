@@ -173,11 +173,12 @@ def _request_with_retry(session: requests.Session, method: str, url: str,
                 time.sleep(wait)
                 continue
             return resp
-        except requests.exceptions.ConnectionError as exc:
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout) as exc:
             last_exc  = exc
             last_resp = None
             wait = backoff ** attempt
-            log.warning(f"  Connection error — retrying in {wait:.0f}s "
+            log.warning(f"  {type(exc).__name__} — retrying in {wait:.0f}s "
                         f"(attempt {attempt}/{retries}): {exc}")
             time.sleep(wait)
 
@@ -668,10 +669,27 @@ def mb_find_artist_mbid(artist_name: str) -> str | None:
 # Lidarr API
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Cache of all Lidarr artists, refreshed once per poll cycle via
+# prime_artist_cache(). Avoids fetching the full list for every song.
+_artist_cache: list = []
+
+
+def prime_artist_cache() -> None:
+    """Fetch all Lidarr artists once at the start of each poll cycle."""
+    global _artist_cache
+    try:
+        resp = _lidarr_get("/api/v1/artist")
+        resp.raise_for_status()
+        _artist_cache = resp.json()
+        log.debug(f"  Artist cache primed: {len(_artist_cache)} artists")
+    except Exception as exc:
+        log.warning(f"  Could not prime artist cache: {exc} — will use empty cache")
+        _artist_cache = []
+
+
 def lidarr_find_artist(mbid: str) -> dict | None:
-    resp = _lidarr_get("/api/v1/artist")
-    resp.raise_for_status()
-    for artist in resp.json():
+    """Look up an artist by MusicBrainz ID using the poll-scoped cache."""
+    for artist in _artist_cache:
         if artist.get("foreignArtistId") == mbid:
             return artist
     return None
@@ -1018,6 +1036,10 @@ def process_song(song: dict) -> tuple[bool, bool]:
 
 def run_once(poll_count: int) -> None:
     log.info(f"─ Poll #{poll_count} {'(dry run) ' if DRY_RUN else ''}─────────────────────────────────────────")
+
+    # Prime the artist cache once for this poll — avoids one API call per song
+    if not DRY_RUN:
+        prime_artist_cache()
 
     # Check pending interventions first
     if not DRY_RUN:
