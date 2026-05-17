@@ -723,11 +723,11 @@ def lidarr_add_artist(artist_name: str, mbid: str) -> dict | None:
         "rootFolderPath":       LIDARR_ROOT_FOLDER,
         "qualityProfileId":     LIDARR_QUALITY_PROFILE_ID,
         "metadataProfileId":    LIDARR_METADATA_PROFILE_ID,
-        "monitored":            False,
+        "monitored":            True,   # artist must be monitored for album searches to run
         "albumFolder":          True,
         "addOptions": {
-            "monitor":                  "none",
-            "searchForMissingAlbums":   False,
+            "monitor":                  "none",    # but don't auto-monitor any albums on add
+            "searchForMissingAlbums":   False,     # we trigger searches manually per album
         },
     }
     if DRY_RUN:
