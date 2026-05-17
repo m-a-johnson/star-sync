@@ -466,9 +466,15 @@ def process_pending_items() -> None:
     if not items:
         return
 
-    ready = [i for i in items if i.get("mb_release_group_id", "").strip()]
+    ready = [i for i in items if i.get("mb_release_group_id", "").strip()
+               and i.get("status") not in ("rescued", "file_gone")]
+    rescued = [i for i in items if i.get("status") in ("rescued", "file_gone")]
+    if rescued:
+        log.debug(f"  {len(rescued)} pending item(s) already rescued — no action needed")
+
     if not ready:
-        log.debug(f"  Pending file has {len(items)} item(s) awaiting manual intervention")
+        if items and not rescued:
+            log.debug(f"  Pending file has {len(items)} item(s) awaiting manual intervention")
         return
 
     log.info(f"  Found {len(ready)} pending item(s) with MusicBrainz IDs to process")
