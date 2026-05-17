@@ -749,6 +749,38 @@ def lidarr_add_artist(artist_name: str, mbid: str) -> dict | None:
     return resp.json()
 
 
+def lidarr_ensure_artist_monitored(artist_id: int, artist_name: str) -> None:
+    """
+    Ensure an artist is set to monitored in Lidarr.
+    Called for both newly added and existing artists before album operations
+    so that album searches actually run.
+    """
+    if DRY_RUN:
+        log.debug(f"  [DRY RUN] Would ensure artist is monitored: {artist_name}")
+        return
+    try:
+        # Fetch current artist state
+        resp = _lidarr_get(f"/api/v1/artist/{artist_id}", timeout=30)
+        resp.raise_for_status()
+        artist_data = resp.json()
+
+        if artist_data.get("monitored"):
+            log.debug(f"  Artist already monitored: {artist_name}")
+            return
+
+        # Set monitored: true
+        artist_data["monitored"] = True
+        resp = _request_with_retry(
+            _lidarr_session, "PUT", f"{LIDARR_URL}/api/v1/artist/{artist_id}",
+            headers={"X-Api-Key": LIDARR_API_KEY},
+            json=artist_data, timeout=30,
+        )
+        resp.raise_for_status()
+        log.info(f"  Set artist to monitored: {artist_name}")
+    except Exception as exc:
+        log.warning(f"  Could not ensure artist monitored: {exc}")
+
+
 def lidarr_wait_for_artist(mbid: str) -> dict | None:
     deadline = time.time() + ARTIST_WAIT_TIMEOUT
     while time.time() < deadline:
@@ -1004,6 +1036,12 @@ def process_song(song: dict) -> tuple[bool, bool]:
             if not artist:
                 log.error(f"  Artist never appeared in Lidarr — aborting.")
                 return False, False
+
+    # Ensure artist is monitored — required for album searches to actually run.
+    # Covers both newly added artists and existing ones that may have been
+    # added previously with monitoring off.
+    if not DRY_RUN and artist:
+        lidarr_ensure_artist_monitored(artist["id"], artist_name)
 
     if not from_aurral:
         log.info(f"  ✓ Done (main library — artist ensured in Lidarr): {artist_name}")
