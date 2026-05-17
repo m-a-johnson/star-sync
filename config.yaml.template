@@ -47,9 +47,14 @@ state_file: /data/state.json
 pending_file: /data/pending.yaml
 
 # How many times to attempt a pending item before giving up the refresh cycle.
-# After this many attempts the item stays in pending.yaml with instructions
-# on how to fix it, but no more refresh calls are made.
+# After this many attempts the file is copied to rescue_path instead.
 pending_max_retries: 5
+
+# Where to copy files that Lidarr cannot index after pending_max_retries attempts.
+# This folder should be outside Aurral's flow directories so it won't be rotated out.
+# Add this path as a separate Navidrome library so rescued tracks remain playable.
+# Must match the volume mount in your docker-compose.yml.
+rescue_path: /rescued
 
 # ── Behaviour ──────────────────────────────────────────────────────────────────
 

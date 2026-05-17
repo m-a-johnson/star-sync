@@ -106,6 +106,7 @@ DOWNLOADS_PATH              = cfg      (_config, "downloads_path",              
 STATE_FILE                  = cfg      (_config, "state_file",                  "STATE_FILE",                  "/data/state.json")
 PENDING_FILE                = cfg      (_config, "pending_file",                "PENDING_FILE",                "/data/pending.yaml")
 PENDING_MAX_RETRIES         = cfg_int  (_config, "pending_max_retries",         "PENDING_MAX_RETRIES",         5)
+RESCUE_PATH                 = cfg      (_config, "rescue_path",                  "RESCUE_PATH",                 "/rescued")
 POLL_INTERVAL               = cfg_int  (_config, "poll_interval",               "POLL_INTERVAL",               300)
 MB_RATE_LIMIT               = cfg_float(_config, "mb_rate_limit",               "MB_RATE_LIMIT",               1.2)
 ARTIST_WAIT_TIMEOUT         = cfg_int  (_config, "artist_wait_timeout",         "ARTIST_WAIT_TIMEOUT",         120)
@@ -387,6 +388,57 @@ def add_to_pending(song: dict, lidarr_artist_id: int, note: str) -> None:
     log.info(f"    https://musicbrainz.org/search?query={song.get('artist', '').replace(' ', '+')}+{song.get('album', '').replace(' ', '+')}&type=release_group")
 
 
+def rescue_file(item: dict, file_path: Path) -> bool:
+    """
+    Copy a file to the rescue folder when Lidarr cannot index it.
+    Organises it as Artist/Album/Track - Title.ext so Navidrome can pick it up.
+    Returns True if the copy succeeded.
+    """
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] Would rescue file to: {RESCUE_PATH}")
+        return True
+
+    rescue_root = Path(RESCUE_PATH)
+    artist      = item.get("artist", "Unknown Artist").strip()
+    album       = item.get("album",  "Unknown Album").strip()
+
+    # Sanitise folder names — remove characters that cause filesystem issues
+    def sanitise(name: str) -> str:
+        for ch in r'<>:"/\|?*':
+            name = name.replace(ch, "_")
+        return name.strip(". ")
+
+    dest_dir = rescue_root / sanitise(artist) / sanitise(album)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_file = dest_dir / file_path.name
+
+    if dest_file.exists():
+        log.info(f"  Rescue file already exists: {dest_file}")
+        return True
+
+    try:
+        import shutil
+        shutil.copy2(file_path, dest_file)
+        log.info(f"  ✓ File rescued to: {dest_file}")
+        return True
+    except Exception as exc:
+        log.error(f"  Failed to rescue file: {exc}", exc_info=True)
+        return False
+
+
+def navidrome_trigger_scan(library_name: str = "Rescued Library") -> None:
+    """Trigger a Navidrome library scan via the Subsonic API."""
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] Would trigger Navidrome scan")
+        return
+    try:
+        resp = _nd_get("/rest/startScan.view")
+        resp.raise_for_status()
+        log.info(f"  Triggered Navidrome scan")
+    except Exception as exc:
+        log.warning(f"  Could not trigger Navidrome scan: {exc}")
+
+
 def process_pending_items() -> None:
     """
     Check the pending file for items that have been filled in with a
@@ -414,15 +466,38 @@ def process_pending_items() -> None:
         log.info(f"  Processing pending: {artist_name} — {album_name} "
                  f"(rg={rg_id}, attempt {retry_count + 1}/{PENDING_MAX_RETRIES})")
 
-        # If retry limit reached, stop the refresh cycle and just log guidance
-        if retry_count >= PENDING_MAX_RETRIES:
+        # If retry limit reached, rescue the file and stop retrying
+        if retry_count >= PENDING_MAX_RETRIES and item.get("status") != "rescued":
             log.warning(f"  Retry limit ({PENDING_MAX_RETRIES}) reached for: {artist_name} — {album_name}")
-            log.warning(f"  This release cannot be found in Lidarr automatically.")
+            log.warning(f"  Lidarr cannot index this release automatically.")
             log.warning(f"  Most likely cause: incomplete MusicBrainz metadata for release group {rg_id}")
-            log.warning(f"  To fix: create a free account at https://musicbrainz.org and add")
-            log.warning(f"    the missing Country and Format data to:")
-            log.warning(f"    https://musicbrainz.org/release-group/{rg_id}")
-            log.warning(f"  Once fixed, reset retry_count to 0 in pending.yaml and star-sync will retry.")
+            log.warning(f"  Attempting to rescue file to: {RESCUE_PATH}")
+
+            # Find the original file in the Aurral downloads folder
+            file_path = find_file_in_downloads(item)
+            if file_path:
+                rescued = rescue_file(item, file_path)
+                if rescued:
+                    item["status"] = "rescued"
+                    item["rescued_to"] = str(Path(RESCUE_PATH) / item.get("artist", "") / item.get("album", ""))
+                    navidrome_trigger_scan()
+                    log.info(f"  File rescued successfully. Add the rescue folder as a Navidrome library")
+                    log.info(f"  if you haven't already: {RESCUE_PATH}")
+                    log.warning(f"  To fix properly: https://musicbrainz.org/release-group/{rg_id}")
+                else:
+                    log.error(f"  Rescue failed — file may already be gone from Aurral flows.")
+                    log.warning(f"  To fix: https://musicbrainz.org/release-group/{rg_id}")
+            else:
+                log.error(f"  File not found in downloads — Aurral may have already rotated it out.")
+                log.warning(f"  To fix: https://musicbrainz.org/release-group/{rg_id}")
+                item["status"] = "file_gone"
+
+            remaining.append(item)
+            continue
+
+        # Already rescued — just keep in pending as a record, no more retrying
+        if item.get("status") == "rescued":
+            log.debug(f"  Already rescued: {artist_name} — {album_name} → {item.get('rescued_to', RESCUE_PATH)}")
             remaining.append(item)
             continue
 
