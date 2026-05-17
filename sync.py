@@ -3,7 +3,7 @@
 navidrome-star-to-lidarr (star-sync)
 ─────────────────────────────────────
 Polls Navidrome for newly starred tracks, finds the artist in MusicBrainz,
-adds them to Lidarr as unmonitored, then monitors and searches for the
+adds them to Lidarr with the artist monitored but no albums auto-monitored,
 specific album containing the starred track.
 
 Configuration is read from config.yaml (mounted into the container).
@@ -535,6 +535,12 @@ def process_pending_items() -> None:
         # Search Lidarr albums for this artist and find the one matching the
         # MusicBrainz release group ID
         try:
+            log.info(f"  Ensuring artist is monitored before album operations…")
+            if not lidarr_ensure_artist_monitored(artist_id, artist_name):
+                log.warning(f"  Artist could not be set to monitored — will retry next poll")
+                remaining.append(item)
+                continue
+
             log.info(f"  Refreshing Lidarr metadata for artist id={artist_id}…")
             lidarr_refresh_artist(artist_id)
             log.info(f"  Waiting 15s for Lidarr to refresh artist metadata…")
@@ -749,15 +755,16 @@ def lidarr_add_artist(artist_name: str, mbid: str) -> dict | None:
     return resp.json()
 
 
-def lidarr_ensure_artist_monitored(artist_id: int, artist_name: str) -> None:
+def lidarr_ensure_artist_monitored(artist_id: int, artist_name: str) -> bool:
     """
     Ensure an artist is set to monitored in Lidarr.
     Called for both newly added and existing artists before album operations
     so that album searches actually run.
+    Returns True if the artist is monitored, False if it could not be set.
     """
     if DRY_RUN:
         log.debug(f"  [DRY RUN] Would ensure artist is monitored: {artist_name}")
-        return
+        return True
     try:
         # Fetch current artist state
         resp = _lidarr_get(f"/api/v1/artist/{artist_id}", timeout=30)
@@ -766,7 +773,7 @@ def lidarr_ensure_artist_monitored(artist_id: int, artist_name: str) -> None:
 
         if artist_data.get("monitored"):
             log.debug(f"  Artist already monitored: {artist_name}")
-            return
+            return True
 
         # Set monitored: true
         artist_data["monitored"] = True
@@ -777,8 +784,10 @@ def lidarr_ensure_artist_monitored(artist_id: int, artist_name: str) -> None:
         )
         resp.raise_for_status()
         log.info(f"  Set artist to monitored: {artist_name}")
+        return True
     except Exception as exc:
         log.warning(f"  Could not ensure artist monitored: {exc}")
+        return False
 
 
 def lidarr_wait_for_artist(mbid: str) -> dict | None:
@@ -1037,22 +1046,21 @@ def process_song(song: dict) -> tuple[bool, bool]:
                 log.error(f"  Artist never appeared in Lidarr — aborting.")
                 return False, False
 
-    # Ensure artist is monitored — required for album searches to actually run.
-    # Covers both newly added artists and existing ones that may have been
-    # added previously with monitoring off.
-    if not DRY_RUN and artist:
-        lidarr_ensure_artist_monitored(artist["id"], artist_name)
-
     if not from_aurral:
-        log.info(f"  ✓ Done (main library — artist ensured in Lidarr): {artist_name}")
+        log.info(f"  ✓ Done (main library — artist exists in Lidarr): {artist_name}")
         return True, False
 
     if DRY_RUN:
         log.info(f"  [DRY RUN] Would find album '{album_name}', monitor it, and trigger search")
         return True, False
 
-    # ── Step 4: find matching album ──────────────────────────────────────────
+    # ── Step 4: ensure artist is monitored ──────────────────────────────────
     artist_id = artist["id"]
+    if not lidarr_ensure_artist_monitored(artist_id, artist_name):
+        log.warning(f"  Could not set artist to monitored — aborting so it can retry later")
+        return False, False
+
+    # ── Step 5: find matching album ───────────────────────────────────────────
     albums    = lidarr_wait_for_albums(artist_id)
     if not albums:
         log.error(f"  No albums found in Lidarr for {artist_name} — aborting.")
@@ -1070,7 +1078,7 @@ def process_song(song: dict) -> tuple[bool, bool]:
 
     log.info(f"  Matched album: {album.get('title')} (id={album.get('id')})")
 
-    # ── Step 5: monitor the album ────────────────────────────────────────────
+    # ── Step 6: monitor the album ────────────────────────────────────────────
     # Small delay to give Lidarr time to fully settle album metadata
     # before accepting monitor updates
     log.debug(f"  Waiting 10s for Lidarr to settle before monitoring...")
@@ -1085,7 +1093,7 @@ def process_song(song: dict) -> tuple[bool, bool]:
         interruptible_sleep(5)
         lidarr_monitor_album(album["id"], album.get("title", ""))
 
-    # ── Step 6: trigger search ───────────────────────────────────────────────
+    # ── Step 7: trigger search ────────────────────────────────────────────────
     lidarr_search_album(album["id"])
 
     log.info(f"  ✓ Done: {artist_name} — {album.get('title')} queued for download")
