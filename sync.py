@@ -128,6 +128,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("star-sync")
 
+# Module-level stop event — set by SIGTERM/SIGINT handler in main().
+# Used throughout the code to make all sleeps interruptible for clean shutdown.
+_stop_event = threading.Event()
+
+
+def interruptible_sleep(seconds: float) -> bool:
+    """
+    Sleep for up to `seconds`, returning early if a shutdown is requested.
+    Returns True if shutdown was requested, False if the full sleep completed.
+    """
+    return _stop_event.wait(timeout=seconds)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Validate required config — fail fast before the main loop starts
@@ -170,7 +182,7 @@ def _request_with_retry(session: requests.Session, method: str, url: str,
                 log.warning(f"  HTTP {resp.status_code} from {url} — retrying in {wait:.0f}s "
                             f"(attempt {attempt}/{retries})")
                 last_resp = resp
-                time.sleep(wait)
+                interruptible_sleep(wait)
                 continue
             return resp
         except (requests.exceptions.ConnectionError,
@@ -180,7 +192,7 @@ def _request_with_retry(session: requests.Session, method: str, url: str,
             wait = backoff ** attempt
             log.warning(f"  {type(exc).__name__} — retrying in {wait:.0f}s "
                         f"(attempt {attempt}/{retries}): {exc}")
-            time.sleep(wait)
+            interruptible_sleep(wait)
 
     # All retries exhausted — include response body if available
     body_hint = ""
@@ -394,15 +406,15 @@ def add_to_pending(song: dict, lidarr_artist_id: int, note: str, file_path: Path
     log.info(f"    https://musicbrainz.org/search?query={song.get('artist', '').replace(' ', '+')}+{song.get('album', '').replace(' ', '+')}&type=release_group")
 
 
-def rescue_file(item: dict, file_path: Path) -> bool:
+def rescue_file(item: dict, file_path: Path) -> str | None:
     """
     Copy a file to the rescue folder when Lidarr cannot index it.
     Organises it as Artist/Album/Track - Title.ext so Navidrome can pick it up.
-    Returns True if the copy succeeded.
+    Returns the sanitised destination directory path on success, None on failure.
     """
     if DRY_RUN:
         log.info(f"  [DRY RUN] Would rescue file to: {RESCUE_PATH}")
-        return True
+        return RESCUE_PATH
 
     rescue_root = Path(RESCUE_PATH)
     artist      = item.get("artist", "Unknown Artist").strip()
@@ -420,17 +432,16 @@ def rescue_file(item: dict, file_path: Path) -> bool:
 
     if dest_file.exists():
         log.info(f"  Rescue file already exists: {dest_file}")
-        return True
+        return str(dest_dir)
 
     try:
         import shutil
         shutil.copy2(file_path, dest_file)
         log.info(f"  ✓ File rescued to: {dest_file}")
-        return True
+        return str(dest_dir)
     except Exception as exc:
         log.error(f"  Failed to rescue file: {exc}", exc_info=True)
-        return False
-
+        return None
 
 def navidrome_trigger_scan(library_name: str = "Rescued Library") -> None:
     """Trigger a Navidrome library scan via the Subsonic API."""
@@ -489,10 +500,10 @@ def process_pending_items() -> None:
                 log.debug(f"  Stored path missing or gone — searching downloads folder")
                 file_path = find_file_in_downloads(item)
             if file_path:
-                rescued = rescue_file(item, file_path)
-                if rescued:
+                rescued_path = rescue_file(item, file_path)
+                if rescued_path:
                     item["status"] = "rescued"
-                    item["rescued_to"] = str(Path(RESCUE_PATH) / item.get("artist", "") / item.get("album", ""))
+                    item["rescued_to"] = rescued_path   # sanitised path from rescue_file
                     navidrome_trigger_scan()
                     log.info(f"  File rescued successfully. Add the rescue folder as a Navidrome library")
                     log.info(f"  if you haven't already: {RESCUE_PATH}")
@@ -520,7 +531,7 @@ def process_pending_items() -> None:
             log.info(f"  Refreshing Lidarr metadata for artist id={artist_id}…")
             lidarr_refresh_artist(artist_id)
             log.info(f"  Waiting 15s for Lidarr to refresh artist metadata…")
-            time.sleep(15)
+            interruptible_sleep(15)
 
             albums = lidarr_get_albums(artist_id)
             album  = next(
@@ -532,7 +543,7 @@ def process_pending_items() -> None:
                 item["retry_count"] = retry_count + 1
                 if item["retry_count"] >= PENDING_MAX_RETRIES:
                     log.warning(f"  Release group {rg_id} still not found after {item['retry_count']} attempts.")
-                    log.warning(f"  Retry limit will be reached — no more refresh cycles after next poll.")
+                    log.warning(f"  Retry limit reached — rescue will be attempted on next poll.")
                     log.warning(f"  Check MusicBrainz data at: https://musicbrainz.org/release-group/{rg_id}")
                 else:
                     log.warning(f"  Release group {rg_id} not found after refresh "
@@ -599,7 +610,7 @@ def _mb_search_artist(artist_name: str) -> str | None:
     Search MusicBrainz for a single artist name.
     Returns MBID of best match or None.
     """
-    time.sleep(MB_RATE_LIMIT)
+    interruptible_sleep(MB_RATE_LIMIT)
     resp = _mb_get("/artist/", query=f'artist:"{artist_name}"', limit=5)
     resp.raise_for_status()
     artists = resp.json().get("artists", [])
@@ -623,7 +634,7 @@ def mb_find_artist_from_recording(recording_id: str) -> str | None:
     Look up a MusicBrainz recording by ID and return the primary artist MBID.
     This is faster and more accurate than text search — no ambiguity.
     """
-    time.sleep(MB_RATE_LIMIT)
+    interruptible_sleep(MB_RATE_LIMIT)
     resp = _mb_get(f"/recording/{recording_id}", inc="artists")
     resp.raise_for_status()
     data = resp.json()
@@ -731,11 +742,14 @@ def lidarr_add_artist(artist_name: str, mbid: str) -> dict | None:
 def lidarr_wait_for_artist(mbid: str) -> dict | None:
     deadline = time.time() + ARTIST_WAIT_TIMEOUT
     while time.time() < deadline:
+        # Re-prime the cache each iteration so a newly added artist
+        # is visible without waiting for the next poll cycle
+        prime_artist_cache()
         artist = lidarr_find_artist(mbid)
         if artist and artist.get("id"):
             return artist
         log.debug(f"  Waiting for Lidarr to index artist {mbid}…")
-        time.sleep(5)
+        interruptible_sleep(5)
     log.warning(f"  Timed out waiting for Lidarr to index artist {mbid}")
     return None
 
@@ -754,7 +768,7 @@ def lidarr_wait_for_albums(artist_id: int) -> list:
             log.debug(f"  Lidarr loaded {len(albums)} album(s)")
             return albums
         log.debug(f"  Waiting for Lidarr to load albums…")
-        time.sleep(5)
+        interruptible_sleep(5)
     log.warning(f"  Timed out waiting for Lidarr to load albums")
     return []
 
@@ -1012,7 +1026,7 @@ def process_song(song: dict) -> tuple[bool, bool]:
     # Small delay to give Lidarr time to fully settle album metadata
     # before accepting monitor updates
     log.debug(f"  Waiting 10s for Lidarr to settle before monitoring...")
-    time.sleep(10)
+    interruptible_sleep(10)
     lidarr_monitor_album(album["id"], album.get("title", ""))
 
     # Verify the monitor call actually stuck
@@ -1020,7 +1034,7 @@ def process_song(song: dict) -> tuple[bool, bool]:
     matched_check = next((a for a in albums_check if a["id"] == album["id"]), None)
     if matched_check and not matched_check.get("monitored"):
         log.warning(f"  Album does not appear monitored after update — retrying once...")
-        time.sleep(5)
+        interruptible_sleep(5)
         lidarr_monitor_album(album["id"], album.get("title", ""))
 
     # ── Step 6: trigger search ───────────────────────────────────────────────
@@ -1101,11 +1115,9 @@ def run_once(poll_count: int) -> None:
 
 
 def main() -> None:
-    stop_event = threading.Event()
-
     def handle_shutdown(signum, frame):
         log.info("Shutdown signal received — stopping cleanly…")
-        stop_event.set()
+        _stop_event.set()
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -1129,13 +1141,13 @@ def main() -> None:
     log.info("═" * 60)
 
     poll_count = 0
-    while not stop_event.is_set():
+    while not _stop_event.is_set():
         poll_count += 1
         try:
             run_once(poll_count)
         except Exception as exc:
             log.error(f"Unhandled error in main loop: {exc}", exc_info=True)
-        stop_event.wait(timeout=POLL_INTERVAL)
+        _stop_event.wait(timeout=POLL_INTERVAL)
 
     log.info("star-sync stopped.")
 
