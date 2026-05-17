@@ -111,6 +111,7 @@ POLL_INTERVAL               = cfg_int  (_config, "poll_interval",               
 MB_RATE_LIMIT               = cfg_float(_config, "mb_rate_limit",               "MB_RATE_LIMIT",               1.2)
 ARTIST_WAIT_TIMEOUT         = cfg_int  (_config, "artist_wait_timeout",         "ARTIST_WAIT_TIMEOUT",         120)
 ALBUM_WAIT_TIMEOUT          = cfg_int  (_config, "album_wait_timeout",          "ALBUM_WAIT_TIMEOUT",          120)
+LIDARR_ARTIST_LIST_TIMEOUT  = cfg_int  (_config, "lidarr_artist_list_timeout",  "LIDARR_ARTIST_LIST_TIMEOUT",  60)
 PROCESS_MAIN_LIBRARY_STARS  = cfg_bool (_config, "process_main_library_stars",  "PROCESS_MAIN_LIBRARY_STARS",  False)
 DRY_RUN                     = cfg_bool (_config, "dry_run",                     "DRY_RUN",                     False)
 LOG_LEVEL                   = cfg      (_config, "log_level",                   "LOG_LEVEL",                   "INFO").upper()
@@ -215,11 +216,11 @@ def _nd_get(path: str, **params) -> requests.Response:
     )
 
 
-def _lidarr_get(path: str, **params) -> requests.Response:
+def _lidarr_get(path: str, timeout: int = 15, **params) -> requests.Response:
     return _request_with_retry(
         _lidarr_session, "GET", f"{LIDARR_URL}{path}",
         headers={"X-Api-Key": LIDARR_API_KEY},
-        params=params, timeout=15,
+        params=params, timeout=timeout,
     )
 
 
@@ -686,10 +687,13 @@ _artist_cache: list = []
 
 
 def prime_artist_cache() -> None:
-    """Fetch all Lidarr artists once at the start of each poll cycle."""
+    """
+    Fetch all Lidarr artists once at the start of each poll cycle.
+    Uses a longer timeout since large libraries can take time to return.
+    """
     global _artist_cache
     try:
-        resp = _lidarr_get("/api/v1/artist")
+        resp = _lidarr_get("/api/v1/artist", timeout=LIDARR_ARTIST_LIST_TIMEOUT)
         resp.raise_for_status()
         _artist_cache = resp.json()
         log.debug(f"  Artist cache primed: {len(_artist_cache)} artists")
@@ -744,7 +748,7 @@ def lidarr_wait_for_artist(mbid: str) -> dict | None:
     while time.time() < deadline:
         # Re-prime the cache each iteration so a newly added artist
         # is visible without waiting for the next poll cycle
-        prime_artist_cache()
+        prime_artist_cache()  # uses 60s timeout internally
         artist = lidarr_find_artist(mbid)
         if artist and artist.get("id"):
             return artist

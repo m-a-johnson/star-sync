@@ -75,6 +75,11 @@ artist_wait_timeout: 120
 # Seconds to wait for Lidarr to finish loading an artist's albums
 album_wait_timeout: 120
 
+# Timeout in seconds for fetching the full artist list from Lidarr.
+# Large libraries may need more than the default 15s — increase if you
+# see ReadTimeout errors on prime_artist_cache during startup.
+lidarr_artist_list_timeout: 60
+
 # Seconds between MusicBrainz requests — do not set below 1.0
 mb_rate_limit: 1.2
 

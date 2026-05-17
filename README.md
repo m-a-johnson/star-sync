@@ -101,6 +101,7 @@ corresponding environment variable (uppercase).
 | `artist_wait_timeout` | Seconds to wait for Lidarr to index a new artist | `120` |
 | `album_wait_timeout` | Seconds to wait for Lidarr to load albums | `120` |
 | `pending_max_retries` | Attempts before falling back to rescue | `5` |
+| `lidarr_artist_list_timeout` | Seconds for fetching the full artist list — increase for large libraries | `60` |
 | `mb_rate_limit` | Seconds between MusicBrainz requests (min 1.0) | `1.2` |
 | `log_level` | Log verbosity: DEBUG, INFO, WARNING, ERROR | `INFO` |
 
